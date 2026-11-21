@@ -1,5 +1,6 @@
 
 # HardenHelp
+[![Uptime (30 days)](https://img.shields.io/uptimerobot/ratio/m804759908-9b8270f0a04f2a9d51becef5)](https://hardenhelp.onrender.com/health)
 
 [![CI](https://github.com/shreyas2006sid-maker/prince28-sec09-hardenhelp/actions/workflows/ci.yml/badge.svg)](https://github.com/shreyas2006sid-maker/prince28-sec09-hardenhelp/actions/workflows/ci.yml)
 [![Live on Render](https://img.shields.io/badge/Live-Render-brightgreen)](https://hardenhelp.onrender.com)
