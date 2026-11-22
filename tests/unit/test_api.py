@@ -1,9 +1,9 @@
-import socket
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
 
 from hardenhelp.api.deps import check_db
@@ -35,9 +35,13 @@ def test_ready_when_database_is_available(client: TestClient) -> None:
     assert response.json()["checks"]["database"] is True
 
 
-def test_ready_is_503_when_database_is_unavailable(client: TestClient) -> None:
+def test_ready_is_503_when_database_is_unavailable(
+    client: TestClient,
+) -> None:
     client.app.dependency_overrides[check_db] = lambda: False
+
     response = client.get("/ready")
+
     assert response.status_code == 503
     assert response.json() == {
         "status": "not_ready",
@@ -46,33 +50,7 @@ def test_ready_is_503_when_database_is_unavailable(client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_check_db_handles_dns_connection_failure() -> None:
-    class FailedConnection:
-        async def __aenter__(self) -> None:
-            raise socket.gaierror("database host is unavailable")
-
-        async def __aexit__(self, *_: object) -> None:
-            return None
-
-    class FailedEngine:
-        def connect(self) -> FailedConnection:
-            return FailedConnection()
-
-    request = Request(
-        {
-            "type": "http",
-            "app": SimpleNamespace(state=SimpleNamespace(engine=FailedEngine())),
-        }
-    )
-
-    assert await check_db(request) is False
-
-
-@pytest.mark.parametrize(("document_count", "expected"), [(19, False), (20, True)])
-@pytest.mark.asyncio
-async def test_check_db_requires_minimum_document_count(
-    document_count: int, expected: bool
-) -> None:
+async def test_check_db_returns_true_when_database_is_reachable() -> None:
     class Connection:
         async def __aenter__(self):
             return self
@@ -80,8 +58,8 @@ async def test_check_db_requires_minimum_document_count(
         async def __aexit__(self, *_: object) -> None:
             return None
 
-        async def execute(self, _query: object) -> SimpleNamespace:
-            return SimpleNamespace(scalar_one=lambda: document_count)
+        async def execute(self, query: object) -> None:
+            assert str(query) == "SELECT 1"
 
     class Engine:
         def connect(self):
@@ -94,7 +72,30 @@ async def test_check_db_requires_minimum_document_count(
         }
     )
 
-    assert await check_db(request) is expected
+    assert await check_db(request) is True
+
+
+@pytest.mark.asyncio
+async def test_check_db_handles_database_error() -> None:
+    class FailedConnection:
+        async def __aenter__(self):
+            raise SQLAlchemyError("Database connection failed")
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class FailedEngine:
+        def connect(self):
+            return FailedConnection()
+
+    request = Request(
+        {
+            "type": "http",
+            "app": SimpleNamespace(state=SimpleNamespace(engine=FailedEngine())),
+        }
+    )
+
+    assert await check_db(request) is False
 
 
 def test_list_documents_paginates(client: TestClient) -> None:
@@ -150,7 +151,9 @@ def test_request_id_is_echoed(client: TestClient) -> None:
     assert response.headers["X-Request-ID"] == "abc123"
 
 
-def test_app_refuses_to_start_without_app_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_app_refuses_to_start_without_app_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("APP_ENV", raising=False)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)

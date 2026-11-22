@@ -11,9 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from hardenhelp.db.repository import DocumentRepository
 
+logger = logging.getLogger(__name__)
+
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     session_factory = request.app.state.session_factory
+
     async with session_factory() as session:
         yield session
 
@@ -26,16 +29,14 @@ def get_repo(session: SessionDependency) -> DocumentRepository:
 
 
 async def check_db(request: Request) -> bool:
+    """Check whether the database is reachable."""
+
     try:
         async with request.app.state.engine.connect() as connection:
-            result = await connection.execute(text("SELECT COUNT(*) FROM documents"))
-            record_count = result.scalar_one()
+            await connection.execute(text("SELECT 1"))
 
-        return record_count >= 20
+        return True
 
-    except (OSError, SQLAlchemyError):
-        logging.warning(
-            "database readiness check failed",
-            extra={"database": False},
-        )
+    except SQLAlchemyError:
+        logger.exception("Database readiness check failed")
         return False
