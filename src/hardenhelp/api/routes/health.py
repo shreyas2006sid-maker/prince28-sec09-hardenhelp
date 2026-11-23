@@ -1,3 +1,4 @@
+﻿
 """Liveness and readiness endpoints."""
 
 from typing import Annotated

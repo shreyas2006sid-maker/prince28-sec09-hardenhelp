@@ -1,3 +1,4 @@
+
 """All settings come from environment variables (or a local .env file)."""
 
 from functools import lru_cache
@@ -11,10 +12,15 @@ from hardenhelp.db.url import to_asyncpg_url
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     app_name: str = "hardenhelp"
     app_env: Literal["local", "ci", "production"]
+    git_sha: str = "unknown"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     data_file: Path = Path("data/sample_records.json")
     database_url: str = "postgresql://localhost:5432/hardenhelp"

@@ -1,4 +1,4 @@
-"""Database dependencies for FastAPI requests."""
+﻿"""Database dependencies for FastAPI requests."""
 
 import logging
 from collections.abc import AsyncIterator
@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hardenhelp.db.repository import DocumentRepository
+
 
 logger = logging.getLogger(__name__)
 
