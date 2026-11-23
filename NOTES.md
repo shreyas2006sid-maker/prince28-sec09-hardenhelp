@@ -4,12 +4,16 @@
 
 ### Migrations (upgrade, downgrade, upgrade)
 
+Commands used:
+
 ```text
 uv run alembic downgrade -1
 uv run alembic current
 uv run alembic upgrade head
 uv run alembic history
 ```
+
+Migration output:
 
 ```text
 Running upgrade  -> d03_001, create documents and pages
@@ -21,42 +25,64 @@ d03_001 -> d03_002 (head), add GIN index on document metadata
 <base> -> d03_001, create documents and pages
 ```
 
+The database is currently at revision `d03_002 (head)`.
+
 ### The loader is idempotent
 
+Actual Neon database runs:
+
 ```text
-run 1: records=20 inserted=20 updated=0 unchanged=0
+run 1: records=20 inserted=0 updated=2 unchanged=18
 run 2: records=20 inserted=0 updated=0 unchanged=20
-run 3 (after editing one record): records=20 inserted=0 updated=1 unchanged=19
 ```
 
-### EXPLAIN for `?ssg_rule=sshd_disable_root_login`
+The second run made no changes, confirming idempotency.
+
+### EXPLAIN for `severity=high`
+
+Command:
 
 ```text
-uv run python scripts/explain.py ssg_rule sshd_disable_root_login
+uv run python scripts/explain.py severity high
 ```
+
+Actual PostgreSQL output:
 
 ```text
 -- 1) What the planner chooses on its own:
-Seq Scan on documents (cost=0.00..11.00 rows=1 width=36)
-Filter: (metadata @> '{"ssg_rule": "sshd_disable_root_login"}'::jsonb)
-Rows Removed by Filter: 19
+Seq Scan on documents  (cost=0.00..11.00 rows=1 width=36) (actual time=0.663..1.099 rows=7.00 loops=1)
+  Filter: (metadata @> '{"severity": "high"}'::jsonb)
+  Rows Removed by Filter: 13
+  Buffers: shared read=2 dirtied=2
+Planning:
+  Buffers: shared hit=143 read=8 dirtied=1
+Planning Time: 9.283 ms
+Execution Time: 1.130 ms
 
 -- 2) Seq scan switched off, to prove the index can be used:
-Bitmap Heap Scan on documents
-Recheck Cond: (metadata @> '{"ssg_rule": "sshd_disable_root_login"}'::jsonb)
--> Bitmap Index Scan on ix_documents_metadata_gin
-Index Cond: (metadata @> '{"ssg_rule": "sshd_disable_root_login"}'::jsonb)
+Bitmap Heap Scan on documents  (cost=12.81..16.82 rows=1 width=36) (actual time=1.353..1.358 rows=7.00 loops=1)
+  Recheck Cond: (metadata @> '{"severity": "high"}'::jsonb)
+  Heap Blocks: exact=2
+  Buffers: shared hit=3 read=2
+  ->  Bitmap Index Scan on ix_documents_metadata_gin  (cost=0.00..12.81 rows=1 width=0) (actual time=1.327..1.327 rows=10.00 loops=1)
+        Index Cond: (metadata @> '{"severity": "high"}'::jsonb)
+        Index Searches: 1
+        Buffers: shared hit=1 read=2
+Planning:
+  Buffers: shared hit=1
+Planning Time: 0.075 ms
+Execution Time: 1.409 ms
 ```
 
-Why did the planner choose a Seq Scan on my table? (2 lines, your own words)
+Why did the planner choose a Seq Scan on my table?
 
-Why: with only 20 sample rows, PostgreSQL estimates that reading the small table directly costs less
-than jumping back and forth between a GIN index and heap pages.
+Why: with only 20 sample rows, PostgreSQL estimates that scanning the small table directly is cheaper than using an index.
 
-When would it switch to the GIN index? (1 line)
+When would it switch to the GIN index?
 
-When the table is large enough that index filtering returns a small fraction of the rows and is
-cheaper than a sequential scan.
+When the table grows and the filter matches a relatively small fraction of rows, making index access cheaper than a sequential scan.
+
+The forced-index execution is not faster for this small dataset. The second query demonstrates that PostgreSQL can use the GIN index.
 
 ---
 
@@ -74,10 +100,8 @@ uid=999(app) gid=999(app) groups=999(app)
 ```
 
 - Size: 300 MB (under the 400 MB target).
-- A measured validation build took 48.57 seconds with cache. The first cold-build time and a
-  rebuild after changing one line were not captured.
-- BuildKit reused the unchanged uv-copy and workdir layers; it rebuilt the dependency stage after
-  `uv.lock` changed.
+- A measured validation build took 48.57 seconds with cache. The first cold-build time and a rebuild after changing one line were not captured.
+- BuildKit reused the unchanged uv-copy and workdir layers; it rebuilt the dependency stage after `uv.lock` changed.
 
 ### The stack
 
@@ -100,10 +124,11 @@ db stopped:  /ready  -> {"status":"not_ready","checks":{"database":false}}  HTTP
 db started:  /ready  -> {"status":"ready","checks":{"database":true}}       HTTP 200
 ```
 
-The load balancer should stop routing to an unready API, but the process is alive and recovers when
-Postgres returns, so restarting the app is unnecessary.
+The load balancer should stop routing to an unready API, but the process is alive and recovers when Postgres returns, so restarting the app is unnecessary.
 
 ### Tests and coverage
+
+Earlier recorded test results:
 
 ```text
 uv run poe test              -> 18 passed
@@ -112,7 +137,17 @@ uv run poe cov               -> 18 passed, 7 skipped; TOTAL 84%
 with TEST_DATABASE_URL set   -> 25 passed; TOTAL 95%
 ```
 
-The unit count is 18 in this checkout. The untested request-failure loggingpath is not covered by the current tests.
+The latest verified test run:
+
+```text
+uv run pytest -rs
+
+27 passed in 13.08s
+```
+
+The integration tests ran against a dedicated local PostgreSQL 17 Docker container on port 5433. The integration fixture created and dropped a temporary test database.
+
+The untested request-failure logging path is not covered by the current tests.
 
 ---
 
