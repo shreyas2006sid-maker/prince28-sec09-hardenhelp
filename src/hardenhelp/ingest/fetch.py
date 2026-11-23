@@ -47,6 +47,7 @@ def read_sources(csv_path: Path) -> list[Source]:
             raise ValueError("CSV must contain url, source, licence, and title columns.")
 
         sources = []
+
         for row in reader:
             if not row.get("url", "").strip():
                 continue
@@ -72,8 +73,31 @@ def licence_is_approved(source: Source) -> bool:
 
 
 def download_url(url: str) -> str:
-    """Return the original source URL without modifying it."""
-    return url
+    """Convert supported GitHub blob URLs to raw file URLs."""
+    parsed = urlsplit(url)
+
+    if parsed.scheme != "https" or parsed.hostname != "github.com":
+        return url
+
+    match = re.fullmatch(
+        r"/([^/]+)/([^/]+)/blob/(main|master)/(.+)",
+        parsed.path,
+    )
+
+    if not match:
+        return url
+
+    owner, repository, branch, file_path = match.groups()
+
+    return urlunsplit(
+        (
+            "https",
+            "raw.githubusercontent.com",
+            f"/{owner}/{repository}/{branch}/{file_path}",
+            parsed.query,
+            "",
+        )
+    )
 
 
 def safe_filename(url: str) -> str:
@@ -82,6 +106,7 @@ def safe_filename(url: str) -> str:
     name = Path(parsed.path).name or "download"
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+
     return f"{digest}_{name}"
 
 
@@ -95,6 +120,7 @@ def retry_after_seconds(value: str | None) -> float | None:
     except ValueError:
         try:
             retry_time = parsedate_to_datetime(value)
+
             if retry_time.tzinfo is None:
                 retry_time = retry_time.replace(tzinfo=UTC)
 
@@ -119,6 +145,50 @@ def is_retryable_status(status: int) -> bool:
     return status in {408, 425, 429} or 500 <= status <= 599
 
 
+def validate_content_type(content_type: str) -> None:
+    """Reject HTML responses instead of saving webpages as source files."""
+    media_type = content_type.split(";", maxsplit=1)[0].strip().casefold()
+
+    if media_type in {"text/html", "application/xhtml+xml"}:
+        raise ValueError("Server returned HTML instead of a source file.")
+
+
+def looks_like_html(content: bytes) -> bool:
+    """Check the beginning of a response for common HTML markers."""
+    prefix = content[:1024].lstrip().lower()
+
+    return (
+        prefix.startswith(b"<!doctype html")
+        or prefix.startswith(b"<html")
+        or prefix.startswith(b"<head")
+        or prefix.startswith(b"<body")
+    )
+
+
+def validate_content_range(value: str, offset: int) -> int:
+    """Validate Content-Range and return the expected number of bytes."""
+    match = re.fullmatch(
+        r"bytes (\d+)-(\d+)/(\d+|\*)",
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        raise ValueError("Server returned an invalid Content-Range header.")
+
+    start, end, total = match.groups()
+    start_number = int(start)
+    end_number = int(end)
+
+    if offset < 0 or start_number != offset or end_number < start_number:
+        raise ValueError("Server returned an unexpected partial range.")
+
+    if total != "*" and end_number >= int(total):
+        raise ValueError("Server returned an invalid total range size.")
+
+    return end_number - start_number + 1
+
+
 class Downloader:
     """Download approved files with robots checks and resumable partial files."""
 
@@ -132,8 +202,10 @@ class Downloader:
     ) -> None:
         if delay < 0:
             raise ValueError("delay cannot be negative")
+
         if not 1 <= max_concurrency <= MAX_CONCURRENCY:
             raise ValueError("max_concurrency must be between 1 and 4")
+
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
 
@@ -146,12 +218,14 @@ class Downloader:
         self.manifest_lock = asyncio.Lock()
 
         self.client: httpx.AsyncClient | None = None
+
         self.robots_cache: dict[str, RobotFileParser | None] = {}
         self.robots_locks: dict[str, asyncio.Lock] = {}
         self.host_locks: dict[str, asyncio.Lock] = {}
         self.last_request: dict[str, float] = {}
 
         self.completed: dict[str, str] = {}
+
         self.counts = {
             "downloaded": 0,
             "skipped": 0,
@@ -167,10 +241,14 @@ class Downloader:
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.client = httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Encoding": "identity",
+            },
             timeout=TIMEOUT,
             follow_redirects=True,
         )
+
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
@@ -204,6 +282,7 @@ class Downloader:
         """Check robots.txt before requesting a source file."""
         parsed = urlsplit(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
+
         robots_url = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
 
         lock = self.robots_locks.setdefault(origin, asyncio.Lock())
@@ -259,6 +338,7 @@ class Downloader:
 
         if not licence_is_approved(source):
             self.counts["blocked"] += 1
+
             return {
                 "url": url,
                 "status": "blocked",
@@ -273,6 +353,7 @@ class Downloader:
 
         if not await self._robots_allowed(fetch_url):
             self.counts["blocked"] += 1
+
             return {
                 "url": url,
                 "status": "blocked",
@@ -291,7 +372,9 @@ class Downloader:
                     try:
                         assert self.client is not None
 
-                        offset = part_file.stat().st_size if part_file.exists() else 0
+                        original_size = part_file.stat().st_size if part_file.exists() else 0
+                        offset = original_size
+
                         headers = {}
 
                         if offset:
@@ -314,19 +397,66 @@ class Downloader:
                                 continue
 
                             response.raise_for_status()
+                            validate_content_type(response.headers.get("Content-Type", ""))
 
-                            if offset and response.status_code == 206:
-                                content_range = response.headers.get("Content-Range", "")
-                                if not content_range.startswith(f"bytes {offset}-"):
-                                    raise ValueError("Server returned an unexpected partial range.")
+                            expected_bytes = None
+
+                            if response.status_code == 206:
+                                if not offset:
+                                    raise ValueError(
+                                        "Server returned partial content without a resume request."
+                                    )
+
+                                expected_bytes = validate_content_range(
+                                    response.headers.get("Content-Range", ""),
+                                    offset,
+                                )
                                 mode = "ab"
+                                download_file = part_file
+                            elif offset:
+                                # A full response must not overwrite valid partial data
+                                # until the replacement response has been validated.
+                                mode = "wb"
+                                download_file = part_file.with_name(part_file.name + ".restart")
                             else:
                                 mode = "wb"
-                                offset = 0
+                                download_file = part_file
 
-                            with part_file.open(mode) as file:
-                                async for chunk in response.aiter_bytes():
-                                    file.write(chunk)
+                            received_bytes = 0
+                            first_chunk = True
+
+                            try:
+                                with download_file.open(mode) as file:
+                                    async for chunk in response.aiter_raw():
+                                        if first_chunk:
+                                            first_chunk = False
+
+                                            if looks_like_html(chunk):
+                                                raise ValueError(
+                                                    "Server returned HTML instead of a source file."
+                                                )
+
+                                        file.write(chunk)
+                                        received_bytes += len(chunk)
+
+                                if expected_bytes is not None and received_bytes != expected_bytes:
+                                    with part_file.open("r+b") as file:
+                                        file.truncate(original_size)
+
+                                    raise ValueError(
+                                        "Downloaded byte count does not match Content-Range."
+                                    )
+
+                                if not download_file.exists() or download_file.stat().st_size == 0:
+                                    raise ValueError("Downloaded file is empty.")
+
+                                if download_file != part_file:
+                                    download_file.replace(part_file)
+
+                            except BaseException:
+                                if download_file != part_file:
+                                    download_file.unlink(missing_ok=True)
+                                raise
 
                         part_file.replace(destination)
 
@@ -342,13 +472,16 @@ class Downloader:
                         }
 
                         await self._write_manifest(result)
+
                         self.completed[url] = str(destination)
                         self.counts["downloaded"] += 1
+
                         return result
 
                     except httpx.TransportError:
                         if attempt + 1 >= self.max_attempts:
                             raise
+
                         await asyncio.sleep(retry_delay(attempt))
 
             raise RuntimeError("Download attempts exhausted.")
@@ -356,8 +489,10 @@ class Downloader:
         except asyncio.CancelledError:
             # Keep the .part file so a later run can resume it.
             raise
+
         except Exception as error:
             self.counts["failed"] += 1
+
             return {
                 "url": url,
                 "status": "failed",
