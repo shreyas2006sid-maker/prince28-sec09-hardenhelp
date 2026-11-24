@@ -1,4 +1,3 @@
-
 """All settings come from environment variables (or a local .env file)."""
 
 from functools import lru_cache

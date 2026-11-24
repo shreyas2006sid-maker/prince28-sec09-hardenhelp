@@ -1,4 +1,3 @@
-
 """JSON logging setup."""
 
 import json
