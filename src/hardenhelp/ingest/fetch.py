@@ -219,7 +219,7 @@ class Downloader:
 
         self.client: httpx.AsyncClient | None = None
 
-        self.robots_cache: dict[str, RobotFileParser | None] = {}
+        self.robots_cache: dict[str, RobotFileParser | bool | None] = {}
         self.robots_locks: dict[str, asyncio.Lock] = {}
         self.host_locks: dict[str, asyncio.Lock] = {}
         self.last_request: dict[str, float] = {}
@@ -282,7 +282,6 @@ class Downloader:
         """Check robots.txt before requesting a source file."""
         parsed = urlsplit(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-
         robots_url = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
 
         lock = self.robots_locks.setdefault(origin, asyncio.Lock())
@@ -290,6 +289,7 @@ class Downloader:
         async with lock:
             if origin not in self.robots_cache:
                 parser = None
+                allowed_when_unavailable = False
 
                 try:
                     assert self.client is not None
@@ -299,18 +299,22 @@ class Downloader:
                         parser = RobotFileParser()
                         parser.set_url(robots_url)
                         parser.parse(response.text.splitlines())
+                    elif 400 <= response.status_code < 500:
+                        allowed_when_unavailable = True
 
                 except httpx.HTTPError:
                     parser = None
 
-                self.robots_cache[origin] = parser
+                self.robots_cache[origin] = (
+                    parser if parser is not None else allowed_when_unavailable
+                )
 
-            parser = self.robots_cache[origin]
+            policy = self.robots_cache[origin]
 
-        if parser is None:
-            return False
+        if isinstance(policy, RobotFileParser):
+            return policy.can_fetch(USER_AGENT, url)
 
-        return parser.can_fetch(USER_AGENT, url)
+        return policy is True
 
     async def _wait_for_host(self, host: str) -> None:
         """Enforce a minimum delay between requests to the same host."""
@@ -414,8 +418,6 @@ class Downloader:
                                 mode = "ab"
                                 download_file = part_file
                             elif offset:
-                                # A full response must not overwrite valid partial data
-                                # until the replacement response has been validated.
                                 mode = "wb"
                                 download_file = part_file.with_name(part_file.name + ".restart")
                             else:
@@ -487,7 +489,6 @@ class Downloader:
             raise RuntimeError("Download attempts exhausted.")
 
         except asyncio.CancelledError:
-            # Keep the .part file so a later run can resume it.
             raise
 
         except Exception as error:
