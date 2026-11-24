@@ -243,3 +243,85 @@ All smoke tests passed!
 - Production deployment and smoke tests were verified.
 - The rollback and subsequent roll-forward were both verified.
 - Cold-start latency and first-request latency were not measured.
+
+---
+
+## D07 · File parsing and page storage
+
+### Corpus parsing
+
+The downloaded corpus contained 5 files:
+
+- 1 Ubuntu 22.04 STIG YAML file
+- 3 individual YAML rule files
+- 1 VAR file
+
+All 5 files were successfully parsed and stored in PostgreSQL.
+
+Latest parsing output:
+
+```text
+Loaded 5 downloaded record(s).
+
+PARSED: 32161c2f381f_stig_ubuntu2204.yml (document_id=21, pages=189, parser=plain)
+PARSED: 700e6db64957_rule.yml (document_id=22, pages=1, parser=plain)
+PARSED: f2742d7e57d5_sysctl_kernel_kptr_restrict_value.var (document_id=23, pages=1, parser=plain)
+PARSED: d673964e617b_rule.yml (document_id=24, pages=1, parser=plain)
+PARSED: 9ba340158085_rule.yml (document_id=25, pages=2, parser=plain)
+
+Parsed: 5
+Failed: 0
+Total: 5
+```
+
+Total pages stored: 194.
+
+### Database verification
+
+Verified document titles and page counts in Neon PostgreSQL.
+
+| Document | Pages |
+|---|---:|
+| Ubuntu 22.04 STIG | 189 |
+| Limit Password Reuse | 1 |
+| Kernel Pointer Restriction Variable | 1 |
+| Account Expiration Rule | 1 |
+| Enable auditd Service | 2 |
+
+Inspected stored page text and confirmed that YAML descriptions, rationale, severity, identifiers, references, and template expressions were preserved.
+
+The STIG document had 188 pages with detected Markdown heading paths. Individual YAML rule files had no detected Markdown headings because their structure uses YAML fields rather than Markdown heading syntax.
+
+### Failures
+
+```text
+Parsed files: 5
+Failed files: 0
+```
+
+No failed files required retrying. The failure table contained no records.
+
+### Parser comparison
+
+Ran:
+
+```text
+uv run python scripts/compare_parsers.py
+```
+
+Results:
+
+- 5 files selected for inspection.
+- All 5 files processed successfully.
+- All files used the plain parser.
+- 0 PDF files were available.
+- 0 HTML files were available.
+
+A second-parser comparison was not performed because the available corpus contained only YAML and VAR files. The existing comparison script reports parser output and manually checked structure; it does not constitute a two-parser benchmark.
+
+### Observations
+
+- YAML rule titles are extracted without parsing Jinja template syntax.
+- The STIG document's Markdown headings are detected and assigned to page heading paths.
+- Individual YAML rule files retain their original structured content.
+- No parsing failures were recorded for this corpus.
