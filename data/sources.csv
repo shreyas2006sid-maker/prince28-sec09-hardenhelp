@@ -1,0 +1,17 @@
+﻿# Target: Ubuntu 22.04 STIG (all rules) + matching ComplianceAsCode rules
+# Sources to look at: DISA STIG downloads, ComplianceAsCode/content GitHub, NIST NCP, OpenSCAP
+# Project card terms: STIGs are free public US government documents; ComplianceAsCode uses BSD-3-Clause (check LICENSE).
+# Sample row must be deleted; the 10 real source rows below replace it.
+# robots.txt is crawler guidance, not a content licence.
+# Reference-only means no permission to download, store, or reproduce the content is assumed.
+url,source,licence,title
+https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_CAN_Ubuntu_22-04_LTS_V2R2_STIG_SCAP_1-3_Benchmark.zip,DISA,"U.S. Government work; generally public domain; inspect embedded notices for third-party restrictions; attribute DISA.",Ubuntu 22.04 STIG SCAP Benchmark V2R2
+https://ncp.nist.gov/checklist/revision/6889,NIST,"NIST material is generally reusable unless specifically marked otherwise; attribute NIST; check linked document notices.",Ubuntu 22.04 STIG Current Checklist
+https://complianceascode.github.io/content-pages/rendered-policies/ubuntu2204/stig_ubuntu2204.html,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Rendered Ubuntu 22.04 STIG
+https://github.com/ComplianceAsCode/content/blob/main/controls/stig_ubuntu2204.yml,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Ubuntu 22.04 STIG Controls
+https://github.com/ComplianceAsCode/content/blob/main/linux_os/guide/system/accounts/accounts-pam/locking_out_password_attempts/accounts_password_pam_pwhistory_remember/rule.yml,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",PAM Password History Rule
+https://github.com/ComplianceAsCode/content/blob/main/linux_os/guide/system/permissions/restrictions/enable_execshield_settings/sysctl_kernel_kptr_restrict_value.var,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Kernel Pointer Restriction Variable
+https://github.com/ComplianceAsCode/content/blob/main/linux_os/guide/system/accounts/accounts-restrictions/account_expiration/account_disable_inactivity_password_auth/rule.yml,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Account Inactivity Rule
+https://github.com/ComplianceAsCode/content/blob/main/linux_os/guide/auditing/service_auditd_enabled/rule.yml,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Auditd Enabled Rule
+https://documentation.ubuntu.com/security/software-integrity/archive-verification/,Ubuntu,"Reference only; page-specific redistribution licence not confirmed; do not reproduce or redistribute content without checking terms.",APT Archive Verification
+https://www.open-scap.org/features/scap-components/,OpenSCAP,"Reference only; page-specific redistribution licence not confirmed; do not reproduce or redistribute content without checking terms.",SCAP Components
