@@ -34,7 +34,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["migrations/versions", "-prince28-sec09-hardenhelp"]
+extend-exclude = ["migrations/versions", "-prince28-sec09-hardenhelp", ".recovery"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
