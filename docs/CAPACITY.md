@@ -1,113 +1,72 @@
-﻿# Capacity and Scalability
+# Capacity and Scalability
 
 ## 1. Purpose
 
-This document records the measured size of the current HardenHelp source corpus and describes the application's capacity requirements and scalability considerations.
+This report estimates corpus capacity using the current downloaded files. It distinguishes measured local data from projections.
 
-The current corpus contains Ubuntu 22.04 STIG and related ComplianceAsCode source records.
+Report generated: 2026-11-25 06:18 UTC
 
-## 2. Measured Corpus Capacity
-
-Measurements were collected on 25 November 2026 using the project's existing parser and `scripts/compare_parsers.py`.
+## 2. Measured Current Corpus
 
 | Metric | Measured value |
 |---|---:|
-| Downloaded source files | 5 |
-| Successfully parsed files | 5 |
-| Logical parsed pages | 194 |
-| Extracted headings | 188 |
+| Downloaded source files | 10 |
+| Successfully parsed files | 10 |
+| Parser-generated pages | 203 |
+| Heading path entries | 188 |
 | Extracted tables | 0 |
-| Extracted characters | 52,058 |
-| Raw corpus size | 64,515 bytes |
-| Raw corpus size (MiB) | Approximately 0.0615 MiB |
-| Estimated tokens | Approximately 13,015 |
+| Extracted characters | 69,618 |
+| Raw source size | 83,198 bytes |
+| Extracted UTF-8 text size | 69,618 bytes |
+| Estimated tokens | 17,404 |
 
-Token count is an estimate using approximately four characters per token. It is not an exact tokenizer measurement.
+Token estimate = extracted characters / 4. This is a planning estimate, not an exact tokenizer result.
 
-The logical page count represents parser-generated pages, not physical PDF pages. The current corpus contains no PDF files.
+## 3. Full Target Projection
 
-The raw source files are excluded from Git using `.gitignore`. The manifest records download metadata.
+The requested planning target is **4,000 files/rules**. This is a projection, not a claim that the target has been collected.
 
-## 3. Embedding Capacity and Cost
+- Average estimated tokens per downloaded file: 1,740.4
+- Projected tokens at the full target: 6,961,600
+- Approximate 500-token chunks at the full target: 13,924
 
-No embedding provider or embedding model is currently configured in the project.
+The projection assumes the average size of the current corpus remains representative. The actual full corpus may be substantially different.
 
-Therefore, an actual embedding cost cannot yet be measured.
+## 4. Embedding Cost
 
-For an estimated 13,015 tokens, the cost can be calculated after selecting a provider:
+No embedding provider or model is configured, so an actual embedding cost cannot currently be calculated.
 
-`Estimated cost = (13,015 / 1,000,000) × provider price per million tokens`
+- Current estimated input: 17,404 tokens.
+- Full-target estimated input: 6,961,600 tokens.
+- Cost formula: (input tokens / 1,000,000) × provider price per million tokens.
+- Convert the provider's price to INR using the applicable exchange rate when estimating rupee cost.
 
-Actual cost may vary depending on the selected model, tokenization, and any additional processing.
+**Question: Is embedding cost a problem?** It cannot be determined until a provider and model price are selected. The full-target token estimate above is the input needed for that calculation.
 
-## 4. Current API Capacity Requirements
+## 5. PostgreSQL Storage
 
-| Area | Requirement |
-|---|---|
-| Minimum records | At least 20 records must be loaded for readiness |
-| Readiness | `/ready` returns HTTP 503 when fewer than 20 records are loaded |
-| Pagination | Results support a limit from 1 to 100 |
-| Search | Text search and exact `stig_id` filtering |
-| Health | `/health` returns HTTP 200 when the service is running |
-| Request tracking | Responses include an `X-Request-ID` |
-| Logging | Structured JSON logs include request timing |
+The extracted text alone occupies 69,618 UTF-8 bytes locally. This is not a measurement of PostgreSQL storage.
 
-## 5. Configuration
+Database storage also includes row, index, JSONB, and database overhead. Vector storage cannot be estimated reliably until the embedding dimensions and storage format are selected.
 
-The application uses environment-based configuration through Pydantic Settings.
+**Question: Do vectors and text fit in free PostgreSQL?** Check the actual database provider dashboard for its current storage limit and current usage. Compare those values with a database-side measurement after loading the full corpus. Do not treat local text bytes as total database size.
 
-Important settings include:
+## 6. Least Certain Estimate
 
-- `app_name`: Application name.
-- `app_env`: Environment (`local`, `ci`, or `production`).
-- `log_level`: Logging level.
-- `data_file`: Path to the configured data file.
-- `database_url`: Database connection URL.
-- `git_sha`: Build or source revision identifier.
+The least certain number is the full-target token projection because it assumes the current files represent all future rules and documents.
 
-Invalid environment values should prevent startup with a clear validation error.
+A better measurement is to collect a representative sample across all target operating systems and file types, count tokens using the selected embedding model's tokenizer, and then project by source category.
 
-## 6. Scalability Considerations
+## 7. What Changes at 10x Corpus Size?
 
-Potential improvements as the dataset grows include:
-
-- Database indexes for frequently searched fields such as `stig_id`.
-- Efficient pagination to avoid loading unnecessary records.
-- Asynchronous database operations for concurrent requests.
-- Connection-pool configuration based on deployment needs.
-- Monitoring request latency, database performance, and memory usage.
-- Separating data ingestion from API request processing.
-- Measuring embedding throughput and cost after selecting an embedding provider.
-
-These are scalability considerations, not claims that every optimization is already implemented.
-
-## 7. Performance Testing
-
-Before production deployment, test the service with progressively larger datasets and concurrent requests.
-
-Record:
-
-- Dataset size.
-- Number of concurrent requests.
-- Average and maximum response time.
-- Error rate.
-- CPU and memory usage.
-- Database response time.
-
-No throughput, latency, or maximum-dataset benchmark is currently claimed by this document.
+- At 10x the current corpus, the rough estimate is 174,040 tokens and 349 chunks of 500 tokens each.
+- Re-measure database storage, indexing, ingestion time, query latency, and embedding cost; do not assume they scale linearly.
 
 ## 8. Current Limitations
 
-- The measured corpus currently contains five downloaded files.
-- The measured corpus contains 194 logical parser-generated pages.
-- Token count is estimated, not measured with a model tokenizer.
 - No embedding provider or model is configured.
-- Maximum supported dataset size has not been established.
-- Production resource requirements have not been benchmarked.
-- The current corpus size does not establish the application's maximum capacity.
-
-## 9. Conclusion
-
-HardenHelp currently has a measured five-file corpus containing 194 logical pages and approximately 13,015 estimated tokens.
-
-The API defines basic readiness and pagination safeguards. Further ingestion, embedding-cost measurement, and load testing are required before assigning production capacity targets.
+- Token count is estimated rather than measured with a model tokenizer.
+- PostgreSQL storage usage and provider quota have not been measured here.
+- Vector dimensions and vector storage overhead are not yet known.
+- The full target corpus has not been collected.
+- Production load and query performance have not been benchmarked.

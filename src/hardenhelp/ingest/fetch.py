@@ -8,6 +8,7 @@ import hashlib
 import json
 import random
 import re
+import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,13 +16,15 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
-from urllib.robotparser import RobotFileParser
 
 import httpx
+from protego import Protego
 
 USER_AGENT = (
-    "HardenHelpBot/0.1 (+https://github.com/shreyas2006sid-maker/prince28-sec09-hardenhelp)"
+    "examate-student-bot/0.1 "
+    "(student project; +https://github.com/shreyas2006sid-maker/prince28-sec09-hardenhelp)"
 )
+
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 MAX_CONCURRENCY = 4
 
@@ -38,11 +41,14 @@ class Source:
 
 def read_sources(csv_path: Path) -> list[Source]:
     """Read source records while ignoring comment lines."""
+
     with Path(csv_path).open("r", encoding="utf-8-sig", newline="") as file:
         lines = (line for line in file if line.strip() and not line.lstrip().startswith("#"))
+
         reader = csv.DictReader(lines)
 
         required = {"url", "source", "licence", "title"}
+
         if not required.issubset(reader.fieldnames or []):
             raise ValueError("CSV must contain url, source, licence, and title columns.")
 
@@ -66,6 +72,7 @@ def read_sources(csv_path: Path) -> list[Source]:
 
 def licence_is_approved(source: Source) -> bool:
     """Allow only explicitly identified BSD-3-Clause ComplianceAsCode records."""
+
     return (
         source.source.casefold() == "complianceascode"
         and "bsd-3-clause" in source.licence.casefold()
@@ -74,6 +81,7 @@ def licence_is_approved(source: Source) -> bool:
 
 def download_url(url: str) -> str:
     """Convert supported GitHub blob URLs to raw file URLs."""
+
     parsed = urlsplit(url)
 
     if parsed.scheme != "https" or parsed.hostname != "github.com":
@@ -100,11 +108,20 @@ def download_url(url: str) -> str:
     )
 
 
+def safe_source_dir(source: str) -> str:
+    """Generate a filesystem-safe directory name for a source."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", source.strip())
+    return cleaned.strip("._-") or "unknown-source"
+
+
 def safe_filename(url: str) -> str:
     """Generate a filesystem-safe, URL-specific filename."""
+
     parsed = urlsplit(url)
     name = Path(parsed.path).name or "download"
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
 
     return f"{digest}_{name}"
@@ -112,11 +129,13 @@ def safe_filename(url: str) -> str:
 
 def retry_after_seconds(value: str | None) -> float | None:
     """Parse a Retry-After header as seconds or an HTTP date."""
+
     if not value:
         return None
 
     try:
         return max(0.0, float(value))
+
     except ValueError:
         try:
             retry_time = parsedate_to_datetime(value)
@@ -128,12 +147,14 @@ def retry_after_seconds(value: str | None) -> float | None:
                 0.0,
                 (retry_time - datetime.now(UTC)).total_seconds(),
             )
+
         except (TypeError, ValueError, OverflowError):
             return None
 
 
 def retry_delay(attempt: int, retry_after: float | None = None) -> float:
     """Calculate exponential backoff with jitter."""
+
     if retry_after is not None:
         return retry_after
 
@@ -142,11 +163,13 @@ def retry_delay(attempt: int, retry_after: float | None = None) -> float:
 
 def is_retryable_status(status: int) -> bool:
     """Identify HTTP statuses that can be retried."""
+
     return status in {408, 425, 429} or 500 <= status <= 599
 
 
 def validate_content_type(content_type: str) -> None:
     """Reject HTML responses instead of saving webpages as source files."""
+
     media_type = content_type.split(";", maxsplit=1)[0].strip().casefold()
 
     if media_type in {"text/html", "application/xhtml+xml"}:
@@ -155,6 +178,7 @@ def validate_content_type(content_type: str) -> None:
 
 def looks_like_html(content: bytes) -> bool:
     """Check the beginning of a response for common HTML markers."""
+
     prefix = content[:1024].lstrip().lower()
 
     return (
@@ -167,6 +191,7 @@ def looks_like_html(content: bytes) -> bool:
 
 def validate_content_range(value: str, offset: int) -> int:
     """Validate Content-Range and return the expected number of bytes."""
+
     match = re.fullmatch(
         r"bytes (\d+)-(\d+)/(\d+|\*)",
         value.strip(),
@@ -177,6 +202,7 @@ def validate_content_range(value: str, offset: int) -> int:
         raise ValueError("Server returned an invalid Content-Range header.")
 
     start, end, total = match.groups()
+
     start_number = int(start)
     end_number = int(end)
 
@@ -211,6 +237,7 @@ class Downloader:
 
         self.output_dir = Path(output_dir)
         self.manifest_path = Path(manifest_path)
+
         self.delay = delay
         self.max_attempts = max_attempts
 
@@ -219,8 +246,9 @@ class Downloader:
 
         self.client: httpx.AsyncClient | None = None
 
-        self.robots_cache: dict[str, RobotFileParser | bool | None] = {}
+        self.robots_cache: dict[str, Protego | bool] = {}
         self.robots_locks: dict[str, asyncio.Lock] = {}
+
         self.host_locks: dict[str, asyncio.Lock] = {}
         self.last_request: dict[str, float] = {}
 
@@ -237,6 +265,7 @@ class Downloader:
 
     async def __aenter__(self) -> Downloader:
         """Create output directories and open the HTTP client."""
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -253,11 +282,13 @@ class Downloader:
 
     async def __aexit__(self, exc_type, exc_value, traceback) -> None:
         """Close the HTTP client."""
+
         if self.client is not None:
             await self.client.aclose()
 
     def _load_manifest(self) -> None:
         """Load previously completed downloads."""
+
         if not self.manifest_path.exists():
             return
 
@@ -279,49 +310,62 @@ class Downloader:
                     continue
 
     async def _robots_allowed(self, url: str) -> bool:
-        """Check robots.txt before requesting a source file."""
+        """Check robots.txt using Protego and fail closed when unavailable."""
+
         parsed = urlsplit(url)
+
         origin = f"{parsed.scheme}://{parsed.netloc}"
+
         robots_url = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
 
         lock = self.robots_locks.setdefault(origin, asyncio.Lock())
 
         async with lock:
             if origin not in self.robots_cache:
-                parser = None
-                allowed_when_unavailable = False
+                policy: Protego | bool = False
 
                 try:
                     assert self.client is not None
+
+                    await self._wait_for_host(parsed.netloc)
+
                     response = await self.client.get(robots_url)
 
-                    if response.status_code == 200:
-                        parser = RobotFileParser()
-                        parser.set_url(robots_url)
-                        parser.parse(response.text.splitlines())
-                    elif 400 <= response.status_code < 500:
-                        allowed_when_unavailable = True
+                    if response.status_code == 404:
+                        # No robots.txt means there are no published crawler rules.
+                        policy = True
 
-                except httpx.HTTPError:
-                    parser = None
+                    elif response.status_code == 200:
+                        policy = Protego.parse(response.text)
 
-                self.robots_cache[origin] = (
-                    parser if parser is not None else allowed_when_unavailable
-                )
+                    else:
+                        # 403, 429, 5xx and unexpected responses fail closed.
+                        policy = False
+
+                except (httpx.HTTPError, ValueError):
+                    # Network errors and invalid robots content fail closed.
+                    policy = False
+
+                self.robots_cache[origin] = policy
 
             policy = self.robots_cache[origin]
 
-        if isinstance(policy, RobotFileParser):
-            return policy.can_fetch(USER_AGENT, url)
+        if policy is True:
+            return True
 
-        return policy is True
+        if policy is False:
+            return False
+
+        return policy.can_fetch(url, USER_AGENT)
 
     async def _wait_for_host(self, host: str) -> None:
         """Enforce a minimum delay between requests to the same host."""
+
         lock = self.host_locks.setdefault(host, asyncio.Lock())
 
         async with lock:
             previous = self.last_request.get(host, 0.0)
+
             elapsed = time.monotonic() - previous
             remaining = self.delay - elapsed
 
@@ -332,12 +376,14 @@ class Downloader:
 
     async def _write_manifest(self, record: dict) -> None:
         """Append a manifest record safely."""
+
         async with self.manifest_lock:
             with self.manifest_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record) + "\n")
 
     async def download(self, source: Source) -> dict:
         """Download one approved source and record its result."""
+
         url = source.url
 
         if not licence_is_approved(source):
@@ -351,7 +397,11 @@ class Downloader:
 
         if url in self.completed and Path(self.completed[url]).is_file():
             self.counts["skipped"] += 1
-            return {"url": url, "status": "skipped"}
+
+            return {
+                "url": url,
+                "status": "skipped",
+            }
 
         fetch_url = download_url(url)
 
@@ -361,11 +411,14 @@ class Downloader:
             return {
                 "url": url,
                 "status": "blocked",
-                "error": "Robots policy unavailable or downloading disallowed.",
+                "error": ("Robots policy unavailable or downloading disallowed."),
             }
 
-        destination = self.output_dir / safe_filename(url)
+        destination = self.output_dir / safe_source_dir(source.source) / safe_filename(url)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
         part_file = destination.with_name(destination.name + ".part")
+
         host = urlsplit(fetch_url).netloc
 
         try:
@@ -377,8 +430,8 @@ class Downloader:
                         assert self.client is not None
 
                         original_size = part_file.stat().st_size if part_file.exists() else 0
-                        offset = original_size
 
+                        offset = original_size
                         headers = {}
 
                         if offset:
@@ -397,10 +450,12 @@ class Downloader:
                                     attempt,
                                     retry_after_seconds(response.headers.get("Retry-After")),
                                 )
+
                                 await asyncio.sleep(wait)
                                 continue
 
                             response.raise_for_status()
+
                             validate_content_type(response.headers.get("Content-Type", ""))
 
                             expected_bytes = None
@@ -415,11 +470,15 @@ class Downloader:
                                     response.headers.get("Content-Range", ""),
                                     offset,
                                 )
+
                                 mode = "ab"
                                 download_file = part_file
+
                             elif offset:
                                 mode = "wb"
+
                                 download_file = part_file.with_name(part_file.name + ".restart")
+
                             else:
                                 mode = "wb"
                                 download_file = part_file
@@ -458,8 +517,10 @@ class Downloader:
                             except BaseException:
                                 if download_file != part_file:
                                     download_file.unlink(missing_ok=True)
+
                                 raise
 
+                        # Atomic rename after the download is complete.
                         part_file.replace(destination)
 
                         result = {
@@ -527,8 +588,23 @@ async def fetch_all(
     on_result: Callable[[dict], None] | None = None,
 ) -> dict[str, int]:
     """Download approved sources into data/raw and return summary counts."""
-    output_dir = Path(root) / "data" / "raw"
-    manifest_path = output_dir / "manifest.jsonl"
+
+    project_root = Path(root)
+
+    output_dir = project_root / "data" / "raw"
+
+    manifest_path = project_root / "data" / "manifest.jsonl"
+
+    # Preserve the existing manifest when moving to the required location.
+    legacy_manifest = output_dir / "manifest.jsonl"
+
+    if not manifest_path.exists() and legacy_manifest.is_file():
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(
+            legacy_manifest,
+            manifest_path,
+        )
 
     async with Downloader(
         output_dir=output_dir,

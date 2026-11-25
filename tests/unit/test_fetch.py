@@ -14,6 +14,7 @@ from hardenhelp.ingest.fetch import (
     retry_after_seconds,
     retry_delay,
     safe_filename,
+    safe_source_dir,
     validate_content_range,
     validate_content_type,
 )
@@ -332,7 +333,8 @@ async def test_download_rejects_incomplete_resumed_response(
     output_dir = tmp_path / "raw"
     output_dir.mkdir()
 
-    destination = output_dir / safe_filename(source.url)
+    destination = output_dir / safe_source_dir(source.source) / safe_filename(source.url)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     part_file = destination.with_name(destination.name + ".part")
     part_file.write_bytes(b"ab")
 
@@ -392,7 +394,7 @@ async def test_download_rejects_html_response(
 
     assert result["status"] == "failed"
     assert "HTML" in result["error"]
-    assert not list((tmp_path / "raw").glob("*.part"))
+    assert not list((tmp_path / "raw").rglob("*.part"))
 
 
 def test_downloader_rejects_negative_delay(tmp_path: Path) -> None:
@@ -451,7 +453,8 @@ async def test_download_preserves_partial_file_when_restart_response_is_invalid(
     output_dir = tmp_path / "raw"
     output_dir.mkdir()
 
-    destination = output_dir / safe_filename(source.url)
+    destination = output_dir / safe_source_dir(source.source) / safe_filename(source.url)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     part_file = destination.with_name(destination.name + ".part")
     part_file.write_bytes(b"original partial data")
 
@@ -472,4 +475,4 @@ async def test_download_preserves_partial_file_when_restart_response_is_invalid(
     assert "HTML" in result["error"]
     assert part_file.read_bytes() == b"original partial data"
     assert not destination.exists()
-    assert not list(output_dir.glob("*.restart"))
+    assert not list(output_dir.rglob("*.restart"))
