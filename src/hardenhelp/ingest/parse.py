@@ -18,7 +18,7 @@ import yaml
 from pypdf import PdfReader
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-TEXT_TYPES = {".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".sgml", ".py"}
+TEXT_TYPES = {".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".sgml", ".py", ".var"}
 DATA_TYPES = {".json", ".yaml", ".yml", ".csv", ".xml"}
 PAGE_CHARS = 3000
 MIN_CHARS_PER_PAGE = 50
