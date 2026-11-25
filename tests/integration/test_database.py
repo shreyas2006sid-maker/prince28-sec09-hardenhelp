@@ -1,8 +1,5 @@
 import hashlib
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -10,10 +7,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from hardenhelp.api.main import create_app
-from hardenhelp.config import Settings
+from hardenhelp.config import Settings, get_settings
 from hardenhelp.db.models import Document
 from hardenhelp.db.repository import DocumentRepository
 from hardenhelp.db.session import make_engine, make_sessionmaker
+from scripts.load_db import main as load_database
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROWS = [
@@ -125,29 +123,33 @@ def test_api_against_real_database(seeded: Settings) -> None:
     assert search.json()["total"] == 1
 
 
-def test_loader_is_idempotent(database_url: str, tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_loader_is_idempotent(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     data = tmp_path / "records.json"
     data.write_text(
         json.dumps([{"id": "L1", "x": 1}, {"id": "L2", "x": 2}]),
         encoding="utf-8",
     )
-    environment = {
-        **os.environ,
-        "APP_ENV": "ci",
-        "DATABASE_URL": database_url,
-        "DATA_FILE": str(data),
-    }
 
-    def run() -> str:
-        result = subprocess.run(
-            [sys.executable, "scripts/load_db.py"],
-            cwd=PROJECT_ROOT,
-            env=environment,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout
+    monkeypatch.setenv("APP_ENV", "ci")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATA_FILE", str(data))
 
-    assert "inserted=2" in run()
-    assert "inserted=0 updated=0 unchanged=2" in run()
+    get_settings.cache_clear()
+
+    try:
+        await load_database()
+        first_output = capsys.readouterr().out
+
+        await load_database()
+        second_output = capsys.readouterr().out
+
+        assert "inserted=2" in first_output
+        assert "inserted=0 updated=0 unchanged=2" in second_output
+    finally:
+        get_settings.cache_clear()

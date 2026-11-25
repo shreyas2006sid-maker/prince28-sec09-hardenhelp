@@ -184,13 +184,41 @@ The inventory includes:
 
 As of 25 November 2026:
 
-- Five ComplianceAsCode source files were successfully downloaded.
-- All five files were successfully parsed.
-- The corpus contains 194 logical parser-generated pages.
+- 10 ComplianceAsCode source files were successfully downloaded.
+- All 10 downloaded files were successfully parsed.
+- No parsing failures were recorded for the current downloaded corpus.
+- The corpus contains 203 parser-generated pages stored in PostgreSQL.
 - The rendered Ubuntu STIG HTML page was not collected because the downloader rejects HTML responses rather than saving webpages as source files.
 - The remaining DISA, NIST, Ubuntu, and OpenSCAP records have not been collected.
 
 The source inventory describes candidate resources; it must not be confused with the actual downloaded corpus.
+
+### 3.2 Parsing and Storage Coverage
+
+Database verification performed on 25 November 2026, using the 10 downloaded records in `data/raw/manifest.jsonl`:
+
+| Metric | Result |
+|---|---:|
+| Downloaded documents | 10 |
+| Successfully parsed documents | 10 |
+| Failed documents | 0 |
+| Unmatched documents | 0 |
+| Document parsing coverage | 100.00% |
+| Expected parser-generated pages | 203 |
+| Pages stored in PostgreSQL | 203 |
+| Page storage coverage | 100.00% |
+
+Document parsing coverage is calculated as:
+
+`successfully parsed downloaded documents / total downloaded documents * 100`
+
+Page storage coverage is calculated as:
+
+`stored pages / expected parser-generated pages * 100`
+
+The expected page count is taken from the `pages` metadata field of successfully parsed documents. Coverage is calculated against the current downloaded manifest, excluding older database records that do not belong to the current manifest.
+
+Page storage coverage measures persistence of parser-generated pages. It does not measure whether every page in the original source was successfully extracted.
 
 ## 4. Licensing and Usage Restrictions
 

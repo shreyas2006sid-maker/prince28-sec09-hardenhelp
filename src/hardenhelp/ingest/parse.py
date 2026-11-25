@@ -8,6 +8,7 @@ because answers will cite "document, page, section".
 import re
 import unicodedata
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,6 +38,7 @@ class ParsedDoc:
     kind: str
     title: str
     pages: list[ParsedPage]
+    scanned_pages: list[int] = field(default_factory=list)
 
 
 class ParseError(Exception):
@@ -51,11 +53,18 @@ class ParseError(Exception):
 # ---------- cleaning ----------
 def clean_text(text: str) -> str:
     """The same small repairs for every parser."""
+
+    # Repair common UTF-8 text incorrectly decoded as Latin-1.
+    if "ï¼" in text or "Ã" in text:
+        with suppress(UnicodeEncodeError, UnicodeDecodeError):
+            text = text.encode("latin-1").decode("utf-8")
+
     text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\x00", "").replace("Â", "")
+    text = text.replace("\x00", "").replace("Ã‚", "")
     text = re.sub(r"(?<=[a-z])-\n(?=[a-z])", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" ?\n ?", "\n", text)
+
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
@@ -211,7 +220,13 @@ def yaml_control_pages(text: str) -> tuple[str, list[ParsedPage]] | None:
     return document_title, pages
 
 
-def finish(parser: str, kind: str, title: str, texts: list[str]) -> ParsedDoc:
+def finish(
+    parser: str,
+    kind: str,
+    title: str,
+    texts: list[str],
+    scanned_pages: list[int] | None = None,
+) -> ParsedDoc:
     texts = drop_repeated_lines([clean_text(t) for t in texts])
     texts = [clean_text(t) for t in texts]
 
@@ -223,10 +238,11 @@ def finish(parser: str, kind: str, title: str, texts: list[str]) -> ParsedDoc:
     final_title = title or (found[0][1] if found else "")
 
     return ParsedDoc(
-        parser,
-        kind,
-        final_title,
-        with_heading_paths(texts),
+        parser=parser,
+        kind=kind,
+        title=final_title,
+        pages=with_heading_paths(texts),
+        scanned_pages=scanned_pages or [],
     )
 
 
@@ -274,11 +290,15 @@ def _open_pdf(path: Path) -> pymupdf.Document:
 
 
 def parse_pdf_pymupdf(path: Path) -> ParsedDoc:
+    """Extract PDF text and identify image-based scanned pages."""
     doc = _open_pdf(path)
     body = _body_size(doc)
-    texts, chars = [], 0
 
-    for page in doc:
+    texts = []
+    scanned_pages = []
+    page_numbers_with_text = []
+
+    for page_no, page in enumerate(doc, start=1):
         tables = list(page.find_tables().tables) if len(page.get_cdrawings()) >= 4 else []
 
         used: set[int] = set()
@@ -311,16 +331,22 @@ def parse_pdf_pymupdf(path: Path) -> ParsedDoc:
                 level = _heading_level(text, size, bold, body)
 
                 out.append(f"{'#' * level} {text}" if level else text)
-                chars += len(text)
 
-            out.append("")
+        page_text = "\n".join(out)
+        page_chars = len(clean_text(page_text))
 
-        texts.append("\n".join(out))
+        texts.append(page_text)
 
-    if chars < MIN_CHARS_PER_PAGE * len(texts):
+        if page_chars >= MIN_CHARS_PER_PAGE:
+            page_numbers_with_text.append(page_no)
+        elif page.get_images(full=True):
+            scanned_pages.append(page_no)
+
+    # Fully image-based PDFs still need OCR.
+    if not page_numbers_with_text and scanned_pages:
         raise ParseError(
             "no_text_layer",
-            f"{chars} characters on {len(texts)} pages: needs OCR",
+            f"No usable text layer found; scanned pages: {scanned_pages}",
         )
 
     return finish(
@@ -328,6 +354,7 @@ def parse_pdf_pymupdf(path: Path) -> ParsedDoc:
         "pdf",
         (doc.metadata or {}).get("title") or "",
         texts,
+        scanned_pages=scanned_pages,
     )
 
 
