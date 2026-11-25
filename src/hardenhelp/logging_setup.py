@@ -1,8 +1,11 @@
-"""JSON logging setup."""
+"""JSON logging setup with request ID context."""
 
 import json
 import logging
 import sys
+from contextvars import ContextVar
+
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 
 
 class JsonFormatter(logging.Formatter):
@@ -10,6 +13,7 @@ class JsonFormatter(logging.Formatter):
         payload = {
             "level": record.levelname,
             "msg": record.getMessage(),
+            "request_id": request_id_ctx.get(),
         }
 
         for key, value in getattr(record, "__dict__", {}).items():
@@ -45,7 +49,8 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-def configure_logging(level: str = "INFO") -> None:
+def setup_logging(level: str = "INFO") -> None:
+    """Configure application JSON logging."""
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
 

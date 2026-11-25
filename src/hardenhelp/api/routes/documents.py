@@ -9,7 +9,7 @@ from hardenhelp.api.errors import problem_response
 from hardenhelp.api.schemas import DocumentList, DocumentStats, Record
 from hardenhelp.db.repository import FILTER_KEY, DocumentRepository
 
-router = APIRouter(prefix="/v1")
+router = APIRouter()
 RepoDependency = Annotated[DocumentRepository, Depends(get_repo)]
 RESERVED_QUERY_PARAMETERS = {"limit", "offset", "q"}
 

@@ -1,52 +1,46 @@
-"""Application factory."""
+"""App factory: build a fully wired FastAPI app from settings."""
 
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import APIRouter, FastAPI
 
-from hardenhelp.api.errors import problem_response, validation_exception_handler
-from hardenhelp.api.middleware import RequestContextMiddleware
-from hardenhelp.api.routes.documents import router as documents_router
-from hardenhelp.api.routes.health import router as health_router
-from hardenhelp.config import Settings
+from hardenhelp.api.errors import register_error_handlers
+from hardenhelp.api.middleware import request_context
+from hardenhelp.api.routes import chat, documents, health
+from hardenhelp.config import Settings, get_settings
+from hardenhelp.db.llm_calls import make_recorder
 from hardenhelp.db.session import make_engine, make_sessionmaker
-from hardenhelp.logging_setup import configure_logging
+from hardenhelp.llm.gateway import build_gateway
+from hardenhelp.logging_setup import setup_logging
+
+logger = logging.getLogger("hardenhelp")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or Settings()
-    configure_logging(settings.log_level)
+    settings = settings or get_settings()
+    setup_logging(settings.log_level)
+    engine = make_engine(settings)  # no connection is opened yet
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        engine = make_engine(settings)
-        app.state.engine = engine
-        app.state.session_factory = make_sessionmaker(engine)
-        try:
-            yield
-        finally:
-            await engine.dispose()
-            logging.info("database engine disposed")
+        logger.info("starting", extra={"status": settings.app_env})
+        yield
+        await engine.dispose()  # close every pooled connection on shutdown
 
-    app = FastAPI(
-        title=settings.app_name,
-        lifespan=lifespan,
-    )
+    app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
-    app.add_middleware(RequestContextMiddleware)
-    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.state.engine = engine
+    app.state.sessionmaker = make_sessionmaker(engine)
+    app.state.system_prompt = chat.load_prompt(settings.prompts_dir)  # missing file: no start
+    app.state.gateway = build_gateway(settings, make_recorder(app.state.sessionmaker))
 
-    async def internal_server_error(request: Request, exc: Exception):
-        return problem_response(
-            request,
-            500,
-            "Internal Server Error",
-            "An unexpected error occurred.",
-        )
+    app.middleware("http")(request_context)
+    register_error_handlers(app)
 
-    app.add_exception_handler(Exception, internal_server_error)
-    app.include_router(health_router)
-    app.include_router(documents_router)
+    v1 = APIRouter(prefix="/v1")
+    v1.include_router(documents.router)
+    v1.include_router(chat.router)
+    app.include_router(health.router)
+    app.include_router(v1)
     return app

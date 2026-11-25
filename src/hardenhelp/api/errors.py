@@ -1,6 +1,6 @@
 """RFC 9457 problem-details responses."""
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -24,23 +24,38 @@ def problem_response(
     }
     if errors is not None:
         body["errors"] = errors
+
     return JSONResponse(
         status_code=status,
         content=body,
-        headers={"Content-Type": "application/problem+json", "X-Request-ID": str(request_id)},
+        headers={
+            "Content-Type": "application/problem+json",
+            "X-Request-ID": str(request_id),
+        },
     )
 
 
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
     errors = []
     for error in exc.errors():
         loc = ".".join(str(part) for part in error["loc"])
-        field = loc.replace("query.", "query.", 1)
-        errors.append({"field": field, "message": error["msg"]})
+        errors.append({"field": loc, "message": error["msg"]})
+
     return problem_response(
         request,
         422,
         "Unprocessable Content",
         "One or more request parameters are invalid.",
         errors=errors,
+    )
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    """Register application-wide exception handlers."""
+    app.add_exception_handler(
+        RequestValidationError,
+        validation_exception_handler,
     )
