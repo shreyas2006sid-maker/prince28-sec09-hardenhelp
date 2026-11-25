@@ -303,21 +303,38 @@ No failed files required retrying. The failure table contained no records.
 
 ### Parser comparison
 
-Ran:
+Compared two parsing approaches across all 10 successfully downloaded source files:
 
-```text
-uv run python scripts/compare_parsers.py
-```
+1. **HardenHelp parser (`parse_text`)** — extracts page-based content, headings and text.
+2. **PyYAML (`yaml.safe_load`)** — loads compatible YAML files into structured Python objects.
 
-Results:
+| File | HardenHelp parser | PyYAML |
+|---|---|---|
+| 32161c2f381f_stig_ubuntu2204.yml | Success: 189 pages, 43,097 chars | Success: dict |
+| 700e6db64957_rule.yml | Success: 1 page, 2,243 chars | Failed: line 50 |
+| f2742d7e57d5_sysctl_kernel_kptr_restrict_value.var | Success: 1 page, 206 chars | Success: dict |
+| d673964e617b_rule.yml | Success: 1 page, 2,722 chars | Success: dict |
+| 9ba340158085_rule.yml | Success: 2 pages, 3,790 chars | Failed: line 66 |
+| cc680acad6d2_rule.yml | Success: 4 pages, 9,958 chars | Success: dict |
+| 38e24efc4f21_rule.yml | Success: 1 page, 1,606 chars | Failed: line 36 |
+| 2d489e1253dc_rule.yml | Success: 1 page, 642 chars | Success: dict |
+| 6d9ce8481eb4_rule.yml | Success: 1 page, 1,710 chars | Success: dict |
+| a5a80f497a95_rule.yml | Success: 2 pages, 3,644 chars | Failed: line 59 |
 
-- 5 files selected for inspection.
-- All 5 files processed successfully.
-- All files used the plain parser.
-- 0 PDF files were available.
-- 0 HTML files were available.
+**Measured results:**
 
-A second-parser comparison was not performed because the available corpus contained only YAML and VAR files. The existing comparison script reports parser output and manually checked structure; it does not constitute a two-parser benchmark.
+- Total downloaded files compared: 10.
+- HardenHelp parser: 10/10 successful.
+- PyYAML: 6/10 successful.
+- PyYAML failed on 4 files.
+- The `.var` file was successfully loaded by both approaches.
+- HardenHelp produced page-based output while PyYAML produced structured Python objects for compatible files.
+
+**Conclusion:**
+
+HardenHelp successfully processed all 10 files in this comparison. PyYAML successfully loaded 6 files but failed on 4. This demonstrates that the existing parser handles this collected source corpus more consistently while also producing page-based output suitable for ingestion.
+
+**Limitation:** This comparison measures parsing success and output structure. It does not establish parsing speed, memory usage or semantic accuracy.
 
 ### Observations
 

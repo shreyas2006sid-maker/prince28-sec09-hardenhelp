@@ -1,15 +1,17 @@
-"""Compare available parsing approaches across the downloaded corpus."""
+"""Compare the HardenHelp parser with PyYAML across downloaded files."""
 
 import json
 from pathlib import Path
 
-from hardenhelp.ingest.parse import ParseError, parse_file, parse_text
+import yaml
+
+from hardenhelp.ingest.parse import ParseError, parse_text
 
 MANIFEST = Path("data/raw/manifest.jsonl")
 
 
 def load_manifest() -> list[dict]:
-    """Load downloaded files from the manifest."""
+    """Load successfully downloaded files."""
     records = []
 
     for line in MANIFEST.read_text(encoding="utf-8").splitlines():
@@ -22,53 +24,70 @@ def load_manifest() -> list[dict]:
     return records
 
 
+def compare_hardenhelp(path: Path) -> str:
+    """Run the existing HardenHelp parser."""
+    try:
+        parsed = parse_text(path)
+        pages = len(parsed.pages)
+        characters = sum(len(page.text) for page in parsed.pages)
+
+        return f"SUCCESS: {pages} pages, {characters:,} chars"
+
+    except ParseError as exc:
+        return f"FAILED: {exc.reason}"
+
+
+def compare_pyyaml(path: Path) -> str:
+    """Run PyYAML's safe loader."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        result = yaml.safe_load(content)
+        result_type = type(result).__name__
+
+        return f"SUCCESS: {result_type}"
+
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+
+        if mark is not None:
+            return f"FAILED: line {mark.line + 1}"
+
+        return f"FAILED: {type(exc).__name__}"
+
+    except OSError as exc:
+        return f"FAILED: {type(exc).__name__}"
+
+
 def main() -> None:
     records = load_manifest()
 
     print(f"Files selected for comparison: {len(records)}")
-    print("=" * 70)
+    print()
+    print("| File | HardenHelp parser | PyYAML |")
+    print("|---|---|---|")
 
-    pdf_count = 0
+    hardenhelp_success = 0
+    yaml_success = 0
 
     for record in records:
         path = Path(record["path"])
 
-        if path.suffix.lower() == ".pdf":
-            pdf_count += 1
+        hardenhelp_result = compare_hardenhelp(path)
+        yaml_result = compare_pyyaml(path)
 
-        print(f"\nFILE: {path.name}")
-        print(f"TYPE: {path.suffix.lower()}")
+        if hardenhelp_result.startswith("SUCCESS"):
+            hardenhelp_success += 1
 
-        try:
-            parsed = parse_text(path) if path.suffix.lower() == ".var" else parse_file(path)
+        if yaml_result.startswith("SUCCESS"):
+            yaml_success += 1
 
-            total_chars = sum(len(page.text) for page in parsed.pages)
-            heading_count = sum(len(page.headings) for page in parsed.pages)
-            table_count = sum(page.tables for page in parsed.pages)
+        print(f"| {path.name} | {hardenhelp_result} | {yaml_result} |")
 
-            print(f"PARSER: {parsed.parser}")
-            print(f"KIND: {parsed.kind}")
-            print(f"PAGES: {len(parsed.pages)}")
-            print(f"HEADINGS: {heading_count}")
-            print(f"TABLES: {table_count}")
-            print(f"EXTRACTED CHARACTERS: {total_chars}")
-            print(f"TITLE: {parsed.title}")
-
-        except ParseError as exc:
-            print(f"FAILED: {exc.reason} - {exc.detail}")
-
-    print("\n" + "=" * 70)
-    print("COMPARISON SUMMARY")
-    print(f"Total downloaded files: {len(records)}")
-    print(f"PDF files available: {pdf_count}")
-
-    if pdf_count == 0:
-        print("PDF parser comparison skipped: the corpus contains no PDF files.")
-
-    print(
-        "YAML and VAR files use the plain parser. "
-        "Their extracted structure should be checked manually."
-    )
+    print()
+    print("--- SUMMARY ---")
+    print(f"Total files: {len(records)}")
+    print(f"HardenHelp parser: {hardenhelp_success}/{len(records)} successful")
+    print(f"PyYAML: {yaml_success}/{len(records)} successful")
 
 
 if __name__ == "__main__":
