@@ -243,3 +243,55 @@ All smoke tests passed!
 - Production deployment and smoke tests were verified.
 - The rollback and subsequent roll-forward were both verified.
 - Cold-start latency and first-request latency were not measured.
+
+---
+
+## D06 · Polite, resumable source downloader
+
+### Source inventory
+
+The downloader reads `data/sources.csv` by default. The CSV must contain:
+
+- `url`
+- `source`
+- `licence`
+- `title`
+
+Blank URLs and comment lines are ignored. Records are downloaded only when the source is `ComplianceAsCode` and the licence identifies `BSD-3-Clause`; other records are reported as blocked.
+
+### Download behaviour
+
+- Uses asynchronous HTTP requests through `httpx`.
+- Checks each host's `robots.txt` policy before downloading.
+- Converts supported GitHub `blob/main` and `blob/master` URLs to raw-file URLs.
+- Limits concurrency to 1–4 downloads and applies a configurable delay between requests to the same host.
+- Retries retryable HTTP responses (408, 425, 429 and 5xx) and transport errors, using exponential backoff with jitter or the server's `Retry-After` value.
+- Uses temporary `.part` files and HTTP range requests to resume interrupted downloads.
+- Validates partial-response ranges and byte counts, rejects HTML responses, and avoids replacing valid partial data with an invalid restart response.
+- Records completed downloads in `data/raw/manifest.jsonl`; a later run skips completed files that still exist.
+- Generates URL-specific safe filenames and records the downloaded file path, source, licence, title and timestamp.
+
+### Running the downloader
+
+Default run:
+
+```powershell
+uv run python scripts/fetch.py
+```
+
+Useful options:
+
+```powershell
+uv run python scripts/fetch.py --help
+uv run python scripts/fetch.py --source ComplianceAsCode
+uv run python scripts/fetch.py --delay 1 --concurrency 4 --attempts 4
+uv run python scripts/fetch.py --csv data/sources.csv
+```
+
+Defaults are a 1-second per-host delay, maximum concurrency of 4, and up to 4 attempts per source. The CLI prints each source result and a final count of downloaded, skipped, blocked and failed records.
+
+### Validation covered by unit tests
+
+The downloader unit tests cover source CSV parsing and validation, licence filtering, GitHub raw URL conversion, safe filenames, retry timing and status classification, HTML rejection, content-range validation, invalid configuration, incomplete resumed responses, and preservation of partial files when a restart response is invalid.
+
+No download totals or test-run totals are recorded here because they were not captured as verified Day 6 measurements.
