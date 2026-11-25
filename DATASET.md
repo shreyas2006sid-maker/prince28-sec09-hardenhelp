@@ -1,4 +1,4 @@
-﻿# HardenHelp Dataset Documentation
+# HardenHelp Dataset Documentation
 
 
 
@@ -180,6 +180,18 @@ The inventory includes:
 
 
 
+### 3.1 Actual Collection Status
+
+As of 25 November 2026:
+
+- Five ComplianceAsCode source files were successfully downloaded.
+- All five files were successfully parsed.
+- The corpus contains 194 logical parser-generated pages.
+- The rendered Ubuntu STIG HTML page was not collected because the downloader rejects HTML responses rather than saving webpages as source files.
+- The remaining DISA, NIST, Ubuntu, and OpenSCAP records have not been collected.
+
+The source inventory describes candidate resources; it must not be confused with the actual downloaded corpus.
+
 ## 4. Licensing and Usage Restrictions
 
 
@@ -260,7 +272,7 @@ The project uses the following locations:
 
 | `data/raw/` | Intended location for downloaded source files |
 
-| `data/manifest.jsonl` | Intended download result records |
+| `data/raw/manifest.jsonl` | Download result records |
 
 | `src/hardenhelp/ingest/fetch.py` | Downloader implementation |
 
@@ -378,12 +390,10 @@ The following practices apply:
 
 
 
-**Project:** HardenHelp  
+**Project:** HardenHelp
 
-**Target platform:** Ubuntu 22.04 LTS  
+**Target platform:** Ubuntu 22.04 LTS
 
-**Inventory file:** `data/sources.csv`  
+**Inventory file:** `data/sources.csv`
 
 **Dataset documentation:** `DATASET.md`
-
-
