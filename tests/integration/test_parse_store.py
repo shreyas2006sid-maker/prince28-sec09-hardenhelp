@@ -50,6 +50,7 @@ def parsed() -> ParsedDoc:
                 tables=0,
             ),
         ],
+        scanned_pages=[2, 3],
     )
 
 
@@ -93,6 +94,27 @@ async def test_save_parsed_creates_document_and_pages(
     assert saved_document.doc_type == "text"
     assert len(pages) == 2
     assert pages[1].headings == ["Security Guide"]
+    assert saved_document.metadata_["scanned_pages"] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_save_parsed_stores_scanned_pages(
+    session,
+    source_file: Path,
+    record: dict[str, str],
+    parsed: ParsedDoc,
+):
+    document = await save_parsed(
+        session,
+        path=source_file,
+        record=record,
+        parsed=parsed,
+    )
+
+    saved_document = await session.get(Document, document.id)
+
+    assert saved_document is not None
+    assert saved_document.metadata_["scanned_pages"] == [2, 3]
 
 
 @pytest.mark.asyncio

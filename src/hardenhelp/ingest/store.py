@@ -33,6 +33,7 @@ async def save_parsed(
         "parser": parsed.parser,
         "pages": len(parsed.pages),
         "tables": sum(page.tables for page in parsed.pages),
+        "scanned_pages": parsed.scanned_pages,
         "source": record.get("source"),
         "download_url": record.get("download_url"),
     }

@@ -10,6 +10,7 @@ from hardenhelp.ingest.parse import (
     headings_in,
     markup_to_markdown,
     parse_file,
+    parse_pdf_pymupdf,
     parse_text,
     split_pages,
     with_heading_paths,
@@ -22,6 +23,7 @@ def test_clean_text_removes_null_bytes():
 
 def test_clean_text_normalizes_unicode():
     assert clean_text("ＡＢＣ") == "ABC"
+    assert clean_text("ï¼¡ï¼¢ï¼£") == "ABC"
 
 
 def test_clean_text_joins_hyphenated_words():
@@ -183,3 +185,64 @@ def test_parse_file_reads_pdf(tmp_path: Path, parser: str):
     assert result.kind == "pdf"
     assert len(result.pages) == 1
     assert "Security Guide" in result.pages[0].text
+
+
+def test_pdf_detects_text_pages_and_preserves_blank_page(tmp_path: Path):
+    path = tmp_path / "mixed.pdf"
+
+    document = pymupdf.open()
+
+    for text in [
+        "First page contains enough text for the parser to identify a valid text layer.",
+        "",
+        "Third page contains enough text for the parser to identify a valid text layer.",
+    ]:
+        page = document.new_page()
+        if text:
+            page.insert_text((72, 72), text)
+
+    document.save(path)
+    document.close()
+
+    result = parse_pdf_pymupdf(path)
+
+    assert len(result.pages) == 3
+    assert result.scanned_pages == []
+    assert result.pages[0].text
+    assert result.pages[1].text == ""
+    assert result.pages[2].text
+
+
+def test_pdf_detects_image_based_scanned_page(tmp_path: Path):
+    path = tmp_path / "scanned_page.pdf"
+    image_path = tmp_path / "sample.png"
+
+    pixmap = pymupdf.Pixmap(
+        pymupdf.csRGB,
+        pymupdf.IRect(0, 0, 100, 100),
+        0,
+    )
+    pixmap.clear_with(255)
+    pixmap.save(image_path)
+
+    document = pymupdf.open()
+
+    text_page = document.new_page()
+    text_page.insert_text(
+        (72, 72),
+        "This page contains enough text to be recognized as a text page.",
+    )
+
+    scanned_page = document.new_page()
+    scanned_page.insert_image(
+        pymupdf.Rect(72, 72, 172, 172),
+        filename=str(image_path),
+    )
+
+    document.save(path)
+    document.close()
+
+    result = parse_pdf_pymupdf(path)
+
+    assert len(result.pages) == 2
+    assert result.scanned_pages == [2]
