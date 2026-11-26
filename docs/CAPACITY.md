@@ -70,3 +70,32 @@ A better measurement is to collect a representative sample across all target ope
 - Vector dimensions and vector storage overhead are not yet known.
 - The full target corpus has not been collected.
 - Production load and query performance have not been benchmarked.
+
+<!-- generated:start -->
+## Measured on my start corpus (2026-11-26 05:13 UTC)
+
+| What | Value |
+|---|---|
+| Files | 4,349 |
+| Size on disk | 12.7 MB |
+| Pages (PDF pages + 1 per 3,000 characters of text/HTML) | 2,656 |
+| Characters of text | 7,937,799 |
+| Estimated tokens (characters / 4) | 1,984,450 |
+| Tokens per page | 747 |
+| PDFs with almost no text (scanned? OCR is Day 7) | 0 |
+| Files not measured (zip, xlsx, unreadable) | 3 |
+
+## Estimate for the full corpus (target: 4,000 files)
+
+| What | How | Value |
+|---|---|---|
+| Scale factor | target / measured | x 0.9 |
+| Tokens | measured tokens x scale | 1.83 M |
+| Raw files | measured MB x scale | 12 MB |
+| Chunks | tokens / 400 x 1.15 overlap | 5,247 |
+| Embedding cost, one time | tokens x 1.15 x $0.15 per 1M | $0.31 = Rs 30 |
+| Vector storage | chunks x 768 numbers x 4 bytes | 16 MB |
+| Text in Postgres | characters x scale x 1.2 | 9 MB |
+
+Assumptions: 4 characters per token, 400-token chunks, 768-dimension embeddings at $0.15 per 1M tokens, Rs 95 per US dollar.
+<!-- generated:end -->

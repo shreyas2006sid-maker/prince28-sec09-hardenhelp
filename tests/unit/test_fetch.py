@@ -1,478 +1,232 @@
+"""The downloader, tested without the internet: httpx.MockTransport plays the website."""
+
+import asyncio
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 
-from hardenhelp.ingest.fetch import (
-    Downloader,
-    Source,
-    download_url,
-    is_retryable_status,
-    licence_is_approved,
-    looks_like_html,
-    read_sources,
-    retry_after_seconds,
-    retry_delay,
-    safe_filename,
-    safe_source_dir,
-    validate_content_range,
-    validate_content_type,
-)
+from hardenhelp.ingest import fetch
+from hardenhelp.ingest.fetch import Source, fetch_all
+
+SITE = "https://docs.example.org"
 
 
-def test_read_sources(tmp_path: Path) -> None:
-    csv_file = tmp_path / "sources.csv"
-    csv_file.write_text(
-        "# Source inventory\n"
+def make_sources(count: int) -> list[Source]:
+    licence = "CC BY 4.0"
+    return [Source(f"{SITE}/guide/page-{i}.html", "Example Docs", licence) for i in range(count)]
+
+
+class FakeSite:
+    """A tiny website. `plan` lists the status codes a path answers with before it says 200."""
+
+    def __init__(self, robots: str | int = 404, plan: dict[str, list[int]] | None = None) -> None:
+        self.robots = robots
+        self.plan = plan or {}
+        self.error_headers: dict[str, str] = {}
+        self.hits: list[str] = []
+        self.busy = 0
+        self.max_busy = 0
+        self.slept: list[float] = []
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/robots.txt":
+            if isinstance(self.robots, int):
+                return httpx.Response(self.robots)
+            return httpx.Response(200, text=self.robots)
+        self.hits.append(path)
+        self.busy += 1
+        self.max_busy = max(self.max_busy, self.busy)
+        await asyncio.sleep(0.005)  # let other downloads start, like a real network would
+        self.busy -= 1
+        queue = self.plan.get(path)
+        status = queue.pop(0) if queue else 200
+        if status != 200:
+            return httpx.Response(status, headers=self.error_headers)
+        return httpx.Response(200, html=f"<h1>{path}</h1>")
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)  # record the wait instead of really waiting
+
+    async def run(self, sources: list[Source], root: Path, **options) -> dict[str, int]:
+        transport = httpx.MockTransport(self.handler)
+        async with httpx.AsyncClient(transport=transport, follow_redirects=True) as client:
+            return await fetch_all(
+                sources, root=root, client=client, sleep=self.sleep, per_host_delay=0, **options
+            )
+
+
+def manifest(root: Path) -> list[dict]:
+    lines = (root / "data" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines]
+
+
+def raw_files(root: Path) -> list[Path]:
+    return [p for p in (root / "data" / "raw").rglob("*") if p.is_file()]
+
+
+async def test_downloads_files_and_records_where_they_came_from(tmp_path):
+    counts = await FakeSite().run(make_sources(3), tmp_path)
+    assert counts == {"downloaded": 3, "skipped": 0, "blocked": 0, "failed": 0}
+    record = manifest(tmp_path)[0]
+    assert record["status"] == "downloaded" and record["licence"] == "CC BY 4.0"
+    saved = tmp_path / record["path"]
+    assert saved.parent == tmp_path / "data" / "raw" / "example-docs"
+    assert saved.suffix == ".html" and saved.stat().st_size == record["bytes"]
+    assert len(record["sha256"]) == 64
+
+
+async def test_second_run_downloads_nothing(tmp_path):
+    site = FakeSite()
+    await site.run(make_sources(5), tmp_path)
+    counts = await site.run(make_sources(5), tmp_path)
+    assert counts["skipped"] == 5 and counts["downloaded"] == 0
+    assert len(site.hits) == 5  # still five requests in total: nothing was fetched twice
+
+
+async def test_resume_fetches_only_what_is_missing(tmp_path):
+    site = FakeSite()
+    await site.run(make_sources(3), tmp_path)  # the run that was "killed" after 3 files
+    counts = await site.run(make_sources(8), tmp_path)
+    assert counts == {"downloaded": 5, "skipped": 3, "blocked": 0, "failed": 0}
+    assert len(site.hits) == 8 and len(set(site.hits)) == 8
+
+
+async def test_deleted_file_is_downloaded_again(tmp_path):
+    site = FakeSite()
+    await site.run(make_sources(2), tmp_path)
+    raw_files(tmp_path)[0].unlink()
+    counts = await site.run(make_sources(2), tmp_path)
+    assert counts["downloaded"] == 1 and counts["skipped"] == 1
+
+
+async def test_retries_a_503_and_then_succeeds(tmp_path):
+    site = FakeSite(plan={"/guide/page-0.html": [503, 503]})
+    counts = await site.run(make_sources(1), tmp_path)
+    assert counts["downloaded"] == 1
+    assert manifest(tmp_path)[0]["attempts"] == 3
+    assert len(site.slept) == 2  # it waited between the attempts
+
+
+async def test_obeys_retry_after_on_429(tmp_path):
+    site = FakeSite(plan={"/guide/page-0.html": [429]})
+    site.error_headers = {"Retry-After": "7"}
+    counts = await site.run(make_sources(1), tmp_path)
+    assert counts["downloaded"] == 1
+    assert site.slept and site.slept[0] >= 7
+
+
+async def test_gives_up_after_max_attempts_and_leaves_no_file(tmp_path):
+    site = FakeSite(plan={"/guide/page-0.html": [500] * 10})
+    counts = await site.run(make_sources(1), tmp_path, max_attempts=3)
+    assert counts["failed"] == 1 and len(site.hits) == 3
+    record = manifest(tmp_path)[0]
+    assert record["status"] == "failed" and record["http_status"] == 500
+    assert raw_files(tmp_path) == []
+
+
+async def test_404_is_not_retried(tmp_path):
+    site = FakeSite(plan={"/guide/page-0.html": [404]})
+    counts = await site.run(make_sources(1), tmp_path)
+    assert counts["failed"] == 1 and len(site.hits) == 1 and site.slept == []
+
+
+async def test_a_failed_file_is_tried_again_on_the_next_run(tmp_path):
+    site = FakeSite(plan={"/guide/page-0.html": [404]})
+    await site.run(make_sources(1), tmp_path)
+    counts = await site.run(make_sources(1), tmp_path)
+    assert counts["downloaded"] == 1
+
+
+async def test_robots_disallow_means_never_requested(tmp_path):
+    site = FakeSite(robots="User-agent: *\nDisallow: /guide/\n")
+    counts = await site.run(make_sources(3), tmp_path)
+    assert counts["blocked"] == 3 and site.hits == []
+
+
+async def test_robots_longest_match_wins(tmp_path):
+    site = FakeSite(robots="User-agent: *\nDisallow: /guide/\nAllow: /guide/page-1\n")
+    counts = await site.run(make_sources(3), tmp_path)
+    assert counts["blocked"] == 2 and site.hits == ["/guide/page-1.html"]
+
+
+async def test_robots_server_error_blocks_the_whole_site(tmp_path):
+    counts = await FakeSite(robots=503).run(make_sources(2), tmp_path)
+    assert counts["blocked"] == 2
+
+
+async def test_never_more_than_max_concurrency_at_once(tmp_path):
+    site = FakeSite()
+    await site.run(make_sources(20), tmp_path, max_concurrency=4)
+    assert 1 < site.max_busy <= 4
+
+
+async def test_broken_connection_leaves_no_half_file(tmp_path):
+    async def body():
+        yield b"<h1>first half"
+        raise httpx.ReadError("connection lost")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, content=body(), headers={"Content-Type": "text/html"})
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        counts = await fetch_all(
+            make_sources(1), root=tmp_path, client=client, sleep=no_sleep, max_attempts=2
+        )
+    assert counts["failed"] == 1
+    assert manifest(tmp_path)[0]["error"] == "ReadError"
+    assert raw_files(tmp_path) == []  # no final file and no .part file
+
+
+def test_backoff_grows_but_stays_inside_its_limits():
+    for attempt in range(12):
+        ceiling = min(60.0, 2.0**attempt)
+        assert all(0 <= fetch.backoff_delay(attempt) <= ceiling for _ in range(50))
+
+
+def test_retry_after_understands_seconds_and_dates():
+    assert fetch.retry_after_seconds("120") == 120.0
+    assert fetch.retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0  # in the past
+    assert fetch.retry_after_seconds("soon") is None
+    assert fetch.retry_after_seconds(None) is None
+
+
+def test_file_names_are_stable_and_safe():
+    url = "https://example.org/files/Annual Report (2024): Final?.PDF"
+    stem = fetch.file_stem(url)
+    assert stem == fetch.file_stem(url)  # same URL, same name, every run
+    assert stem != fetch.file_stem(url + "x")
+    assert all(ch.isalnum() or ch == "-" for ch in stem)
+    assert fetch.pick_ext("https://example.org/a/b.PDF", "text/html") == ".pdf"
+    assert fetch.pick_ext("https://example.org/view.aspx?id=7", "application/pdf") == ".pdf"
+    assert fetch.pick_ext("https://example.org/thing", "weird/type") == ".bin"
+
+
+def test_read_sources_skips_notes_and_duplicates(tmp_path):
+    path = tmp_path / "sources.csv"
+    path.write_text(
+        "# my notes\n"
         "url,source,licence,title\n"
-        "https://example.com/file.txt,Example,BSD-3-Clause,Example File\n",
+        "https://example.org/a.pdf,example,CC BY 4.0,Report A\n"
+        "\n"
+        "https://example.org/a.pdf,example,CC BY 4.0,Report A again\n"
+        'https://example.org/b.pdf,example,"Public, cite the page",\n',
         encoding="utf-8",
     )
-
-    sources = read_sources(csv_file)
-
-    assert len(sources) == 1
-    assert sources[0] == Source(
-        url="https://example.com/file.txt",
-        source="Example",
-        licence="BSD-3-Clause",
-        title="Example File",
-    )
-
-
-def test_read_sources_missing_columns(tmp_path: Path) -> None:
-    csv_file = tmp_path / "invalid.csv"
-    csv_file.write_text("url,source,title\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="CSV must contain"):
-        read_sources(csv_file)
-
-
-def test_read_sources_skips_empty_urls(tmp_path: Path) -> None:
-    csv_file = tmp_path / "sources.csv"
-    csv_file.write_text(
-        "url,source,licence,title\n"
-        ",Example,BSD-3-Clause,Empty URL\n"
-        "https://example.com/file.txt,Example,BSD-3-Clause,Valid URL\n",
-        encoding="utf-8",
-    )
-
-    sources = read_sources(csv_file)
-
-    assert len(sources) == 1
-    assert sources[0].title == "Valid URL"
-
-
-def test_licence_is_approved() -> None:
-    source = Source(
-        url="https://example.com/file",
-        source="ComplianceAsCode",
-        licence="BSD-3-Clause",
-        title="Approved File",
-    )
-
-    assert licence_is_approved(source) is True
-
-
-@pytest.mark.parametrize(
-    ("source_name", "licence"),
-    [
-        ("DISA", "BSD-3-Clause"),
-        ("NIST", "Public Domain"),
-        ("ComplianceAsCode", "MIT"),
-        ("Ubuntu", "GPL-3.0"),
-    ],
-)
-def test_licence_is_blocked(source_name: str, licence: str) -> None:
-    source = Source(
-        url="https://example.com/file",
-        source=source_name,
-        licence=licence,
-        title="Blocked File",
-    )
-
-    assert licence_is_approved(source) is False
-
-
-def test_download_url_converts_github_blob_url() -> None:
-    url = "https://github.com/ComplianceAsCode/content/blob/main/linux_os/guide/example.yml"
-    expected = (
-        "https://raw.githubusercontent.com/ComplianceAsCode/content/main/linux_os/guide/example.yml"
-    )
-
-    assert download_url(url) == expected
-
-
-def test_download_url_preserves_non_github_url() -> None:
-    url = "https://example.com/files/example.yml"
-
-    assert download_url(url) == url
-
-
-def test_download_url_preserves_unsupported_github_url() -> None:
-    url = "https://github.com/example/project/tree/main/file.txt"
-
-    assert download_url(url) == url
-
-
-def test_safe_filename() -> None:
-    filename = safe_filename("https://example.com/files/test file.txt")
-
-    assert filename.endswith("_test_file.txt")
-    assert "/" not in filename
-    assert "\\" not in filename
-
-
-def test_safe_filename_is_unique_for_different_urls() -> None:
-    first = safe_filename("https://example.com/file.txt")
-    second = safe_filename("https://another.com/file.txt")
-
-    assert first != second
-
-
-def test_safe_filename_removes_unsafe_characters() -> None:
-    result = safe_filename("https://example.com/../../Alpha Rule!")
-
-    assert result.endswith("_Alpha_Rule_")
-    assert "/" not in result
-    assert "\\" not in result
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("10", 10.0),
-        ("0", 0.0),
-        ("-5", 0.0),
-        (None, None),
-        ("invalid", None),
-    ],
-)
-def test_retry_after_seconds(
-    value: str | None,
-    expected: float | None,
-) -> None:
-    assert retry_after_seconds(value) == expected
-
-
-def test_retry_delay_uses_exponential_backoff() -> None:
-    assert retry_delay(1) >= 2
-    assert retry_delay(1) < 3
-
-
-def test_retry_delay_uses_retry_after_value() -> None:
-    assert retry_delay(1, retry_after=10) == 10
-
-
-@pytest.mark.parametrize(
-    ("status", "expected"),
-    [
-        (200, False),
-        (301, False),
-        (400, False),
-        (408, True),
-        (425, True),
-        (429, True),
-        (500, True),
-        (503, True),
-        (599, True),
-        (600, False),
-    ],
-)
-def test_is_retryable_status(status: int, expected: bool) -> None:
-    assert is_retryable_status(status) is expected
-
-
-@pytest.mark.parametrize(
-    "content_type",
-    [
-        "text/html",
-        "text/html; charset=utf-8",
-        "application/xhtml+xml",
-    ],
-)
-def test_validate_content_type_rejects_html(content_type: str) -> None:
-    with pytest.raises(ValueError):
-        validate_content_type(content_type)
-
-
-@pytest.mark.parametrize(
-    "content_type",
-    [
-        "text/plain",
-        "application/yaml",
-        "application/octet-stream",
-        "application/json",
-    ],
-)
-def test_validate_content_type_accepts_non_html(content_type: str) -> None:
-    validate_content_type(content_type)
-
-
-def test_looks_like_html_detects_html() -> None:
-    assert looks_like_html(b"<!DOCTYPE html><html>")
-
-
-def test_looks_like_html_detects_html_with_leading_spaces() -> None:
-    assert looks_like_html(b"   <html><body>Example</body></html>")
-
-
-def test_looks_like_html_rejects_plain_text() -> None:
-    assert not looks_like_html(b"Ubuntu security rule")
-
-
-def test_looks_like_html_rejects_empty_content() -> None:
-    assert not looks_like_html(b"")
-
-
-def test_validate_content_range_accepts_valid_range() -> None:
-    assert validate_content_range("bytes 100-199/500", 100) == 100
-
-
-def test_validate_content_range_rejects_wrong_start() -> None:
-    with pytest.raises(ValueError):
-        validate_content_range("bytes 0-99/500", 100)
-
-
-def test_validate_content_range_rejects_invalid_format() -> None:
-    with pytest.raises(ValueError):
-        validate_content_range("invalid-range", 100)
-
-
-def test_validate_content_range_rejects_end_before_start() -> None:
-    with pytest.raises(ValueError):
-        validate_content_range("bytes 100-99/500", 100)
-
-
-def test_validate_content_range_rejects_end_beyond_total() -> None:
-    with pytest.raises(ValueError):
-        validate_content_range("bytes 100-500/500", 100)
-
-
-def test_validate_content_range_rejects_negative_offset() -> None:
-    with pytest.raises(ValueError):
-        validate_content_range("bytes 0-99/500", -1)
-
-
-@pytest.mark.asyncio
-async def test_download_rejects_partial_response_without_resume(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Source(
-        url="https://example.com/file.yml",
-        source="ComplianceAsCode",
-        licence="BSD-3-Clause",
-        title="Example",
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            206,
-            headers={
-                "Content-Type": "text/plain",
-                "Content-Range": "bytes 0-2/3",
-            },
-            content=b"abc",
-        )
-
-    async def allow_robots(url: str) -> bool:
-        return True
-
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-        max_attempts=1,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr(downloader, "_robots_allowed", allow_robots)
-
-        result = await downloader.download(source)
-
-    assert result["status"] == "failed"
-    assert "without a resume request" in result["error"]
-
-
-@pytest.mark.asyncio
-async def test_download_rejects_incomplete_resumed_response(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Source(
-        url="https://example.com/file.yml",
-        source="ComplianceAsCode",
-        licence="BSD-3-Clause",
-        title="Example",
-    )
-
-    class IncompleteStream(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield b"cd"
-
-        async def aclose(self) -> None:
-            pass
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Range"] == "bytes=2-"
-
-        return httpx.Response(
-            206,
-            headers={
-                "Content-Type": "text/plain",
-                "Content-Range": "bytes 2-4/5",
-            },
-            stream=IncompleteStream(),
-        )
-
-    async def allow_robots(url: str) -> bool:
-        return True
-
-    output_dir = tmp_path / "raw"
-    output_dir.mkdir()
-
-    destination = output_dir / safe_source_dir(source.source) / safe_filename(source.url)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    part_file = destination.with_name(destination.name + ".part")
-    part_file.write_bytes(b"ab")
-
-    async with Downloader(
-        output_dir,
-        tmp_path / "manifest.jsonl",
-        delay=0,
-        max_attempts=1,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr(downloader, "_robots_allowed", allow_robots)
-
-        result = await downloader.download(source)
-
-    assert result["status"] == "failed"
-    assert "byte count does not match" in result["error"]
-    assert part_file.read_bytes() == b"ab"
-    assert not destination.exists()
-
-
-@pytest.mark.asyncio
-async def test_download_rejects_html_response(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Source(
-        url="https://example.com/file.yml",
-        source="ComplianceAsCode",
-        licence="BSD-3-Clause",
-        title="Example",
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "text/html"},
-            content=b"<html>Example error page</html>",
-        )
-
-    async def allow_robots(url: str) -> bool:
-        return True
-
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-        max_attempts=1,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr(downloader, "_robots_allowed", allow_robots)
-
-        result = await downloader.download(source)
-
-    assert result["status"] == "failed"
-    assert "HTML" in result["error"]
-    assert not list((tmp_path / "raw").rglob("*.part"))
-
-
-def test_downloader_rejects_negative_delay(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="delay cannot be negative"):
-        Downloader(
-            output_dir=tmp_path / "raw",
-            manifest_path=tmp_path / "manifest.jsonl",
-            delay=-1,
-        )
-
-
-@pytest.mark.parametrize("concurrency", [0, 5, 10])
-def test_downloader_rejects_invalid_concurrency(
-    tmp_path: Path,
-    concurrency: int,
-) -> None:
-    with pytest.raises(ValueError, match="between 1 and 4"):
-        Downloader(
-            output_dir=tmp_path / "raw",
-            manifest_path=tmp_path / "manifest.jsonl",
-            max_concurrency=concurrency,
-        )
-
-
-def test_downloader_rejects_invalid_attempts(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="at least 1"):
-        Downloader(
-            output_dir=tmp_path / "raw",
-            manifest_path=tmp_path / "manifest.jsonl",
-            max_attempts=0,
-        )
-
-
-@pytest.mark.asyncio
-async def test_download_preserves_partial_file_when_restart_response_is_invalid(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Source(
-        url="https://example.com/file.yml",
-        source="ComplianceAsCode",
-        licence="BSD-3-Clause",
-        title="Example",
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "text/html"},
-            content=b"<html>Invalid response</html>",
-        )
-
-    async def allow_robots(url: str) -> bool:
-        return True
-
-    output_dir = tmp_path / "raw"
-    output_dir.mkdir()
-
-    destination = output_dir / safe_source_dir(source.source) / safe_filename(source.url)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    part_file = destination.with_name(destination.name + ".part")
-    part_file.write_bytes(b"original partial data")
-
-    async with Downloader(
-        output_dir,
-        tmp_path / "manifest.jsonl",
-        delay=0,
-        max_attempts=1,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        monkeypatch.setattr(downloader, "_robots_allowed", allow_robots)
-
-        result = await downloader.download(source)
-
-    assert result["status"] == "failed"
-    assert "HTML" in result["error"]
-    assert part_file.read_bytes() == b"original partial data"
-    assert not destination.exists()
-    assert not list(output_dir.rglob("*.restart"))
+    sources = fetch.read_sources(path)
+    assert [s.url for s in sources] == ["https://example.org/a.pdf", "https://example.org/b.pdf"]
+    assert sources[1].licence == "Public, cite the page"
+
+
+def test_a_source_without_a_licence_is_refused(tmp_path):
+    path = tmp_path / "sources.csv"
+    path.write_text("url,source,licence,title\nhttps://example.org/a.pdf,example,,\n")
+    with pytest.raises(ValueError, match="licence"):
+        fetch.read_sources(path)

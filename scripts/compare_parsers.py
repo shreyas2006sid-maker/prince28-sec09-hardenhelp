@@ -1,17 +1,27 @@
-"""Compare the HardenHelp parser with PyYAML across downloaded files."""
+"""Compare document parsers across downloaded files."""
 
+import argparse
 import json
+import re
 from pathlib import Path
 
-import yaml
+import pymupdf
+import trafilatura
+from pypdf import PdfReader
 
-from hardenhelp.ingest.parse import ParseError, parse_text
+from hardenhelp.ingest.parse import ParseError, parse_file
 
 MANIFEST = Path("data/raw/manifest.jsonl")
+NOTES = Path("NOTES.md")
+
+OTHER_EXTENSIONS = {".md", ".markdown", ".rst", ".yaml", ".yml", ".txt", ".var"}
 
 
 def load_manifest() -> list[dict]:
     """Load successfully downloaded files."""
+    if not MANIFEST.exists():
+        return []
+
     records = []
 
     for line in MANIFEST.read_text(encoding="utf-8").splitlines():
@@ -19,7 +29,9 @@ def load_manifest() -> list[dict]:
             record = json.loads(line)
 
             if record.get("status") == "downloaded":
-                records.append(record)
+                path = Path(record["path"])
+                if path.is_file():
+                    records.append(record)
 
     return records
 
@@ -27,67 +39,145 @@ def load_manifest() -> list[dict]:
 def compare_hardenhelp(path: Path) -> str:
     """Run the existing HardenHelp parser."""
     try:
-        parsed = parse_text(path)
+        parsed = parse_file(path)
         pages = len(parsed.pages)
         characters = sum(len(page.text) for page in parsed.pages)
+        preview = " ".join(page.text.strip() for page in parsed.pages)[:150]
 
-        return f"SUCCESS: {pages} pages, {characters:,} chars"
-
+        return f"SUCCESS: {pages} pages, {characters:,} chars; preview: {preview!r}"
     except ParseError as exc:
         return f"FAILED: {exc.reason}"
+    except Exception as exc:
+        return f"FAILED: {type(exc).__name__}"
 
 
-def compare_pyyaml(path: Path) -> str:
-    """Run PyYAML's safe loader."""
+def compare_pdf(path: Path) -> tuple[str, str]:
+    """Compare PyMuPDF and pypdf on a PDF."""
+    try:
+        with pymupdf.open(path) as document:
+            page_count = len(document)
+            characters = sum(len(page.get_text()) for page in document)
+
+        pymupdf_result = f"SUCCESS: {page_count} pages, {characters:,} chars"
+    except Exception as exc:
+        pymupdf_result = f"FAILED: {type(exc).__name__}"
+
+    try:
+        reader = PdfReader(str(path))
+        page_count = len(reader.pages)
+        characters = sum(len(page.extract_text() or "") for page in reader.pages)
+        pypdf_result = f"SUCCESS: {page_count} pages, {characters:,} chars"
+    except Exception as exc:
+        pypdf_result = f"FAILED: {type(exc).__name__}"
+
+    return pymupdf_result, pypdf_result
+
+
+def compare_html(path: Path) -> tuple[str, str]:
+    """Compare Trafilatura with basic HTML tag stripping."""
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
-        result = yaml.safe_load(content)
-        result_type = type(result).__name__
+        extracted = trafilatura.extract(content) or ""
+        trafilatura_result = f"SUCCESS: {len(extracted):,} chars"
+    except Exception as exc:
+        trafilatura_result = f"FAILED: {type(exc).__name__}"
 
-        return f"SUCCESS: {result_type}"
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        stripped = re.sub(r"<[^>]+>", " ", content)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        plain_result = f"SUCCESS: {len(stripped):,} chars"
+    except Exception as exc:
+        plain_result = f"FAILED: {type(exc).__name__}"
 
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
+    return trafilatura_result, plain_result
 
-        if mark is not None:
-            return f"FAILED: line {mark.line + 1}"
 
-        return f"FAILED: {type(exc).__name__}"
+def select_files(records: list[dict], explicit: list[str]) -> list[Path]:
+    """Select explicit paths or the largest relevant downloaded files."""
+    if explicit:
+        return [Path(item) for item in explicit]
 
-    except OSError as exc:
-        return f"FAILED: {type(exc).__name__}"
+    candidates = [
+        Path(record["path"])
+        for record in records
+        if Path(record["path"]).suffix.lower() in {".pdf", ".html", ".htm"}
+    ]
+
+    if not candidates:
+        candidates = [
+            Path(record["path"])
+            for record in records
+            if Path(record["path"]).suffix.lower() in OTHER_EXTENSIONS
+        ]
+
+    return sorted(
+        candidates,
+        key=lambda path: path.stat().st_size,
+        reverse=True,
+    )[:10]
+
+
+def append_notes(lines: list[str]) -> None:
+    """Append comparison results without replacing existing notes."""
+    if not lines:
+        print("No comparison results to append to NOTES.md.")
+        return
+
+    with NOTES.open("a", encoding="utf-8") as file:
+        file.write("\n\n## Day 7 Parser Comparison\n\n")
+        file.write("\n".join(lines))
+        file.write("\n")
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare HardenHelp document parsers.")
+    parser.add_argument("paths", nargs="*", help="Optional file paths.")
+    args = parser.parse_args()
+
     records = load_manifest()
+    paths = select_files(records, args.paths)
 
-    print(f"Files selected for comparison: {len(records)}")
+    print(f"Files selected for comparison: {len(paths)}")
     print()
-    print("| File | HardenHelp parser | PyYAML |")
-    print("|---|---|---|")
 
-    hardenhelp_success = 0
-    yaml_success = 0
+    table = [
+        "| File | HardenHelp parser | Comparison parser |",
+        "|---|---|---|",
+    ]
 
-    for record in records:
-        path = Path(record["path"])
+    compared = 0
 
+    for path in paths:
+        if not path.is_file():
+            print(f"SKIPPED: {path} (file not found)")
+            continue
+
+        suffix = path.suffix.lower()
         hardenhelp_result = compare_hardenhelp(path)
-        yaml_result = compare_pyyaml(path)
 
-        if hardenhelp_result.startswith("SUCCESS"):
-            hardenhelp_success += 1
+        if suffix == ".pdf":
+            first, second = compare_pdf(path)
+            comparison = f"PyMuPDF: {first}; pypdf: {second}"
 
-        if yaml_result.startswith("SUCCESS"):
-            yaml_success += 1
+        elif suffix in {".html", ".htm"}:
+            first, second = compare_html(path)
+            comparison = f"Trafilatura: {first}; tag stripping: {second}"
 
-        print(f"| {path.name} | {hardenhelp_result} | {yaml_result} |")
+        else:
+            comparison = "Single parser; manual output inspection"
+
+        table.append(f"| {path.name} | {hardenhelp_result} | {comparison} |")
+        compared += 1
+
+    if compared:
+        print("\n".join(table))
+        append_notes(table)
+    else:
+        print("No supported files were available for comparison.")
 
     print()
-    print("--- SUMMARY ---")
-    print(f"Total files: {len(records)}")
-    print(f"HardenHelp parser: {hardenhelp_success}/{len(records)} successful")
-    print(f"PyYAML: {yaml_success}/{len(records)} successful")
+    print(f"compared {compared} files -> table written to NOTES.md")
 
 
 if __name__ == "__main__":

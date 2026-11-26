@@ -244,6 +244,40 @@ All smoke tests passed!
 - The rollback and subsequent roll-forward were both verified.
 - Cold-start latency and first-request latency were not measured.
 
+
+## D06 · Collecting the corpus
+
+- Start target: Ubuntu 22.04 STIG (all rules) + matching ComplianceAsCode rules
+- Collected today: ___ files, ___ pages, ___ MB (from DATASET.md)
+- Doors used: URL list / Git repository / sitemap / by hand (keep the ones I used)
+
+### Licence check
+
+| Source | Licence or terms, in my words | May I show full text in answers? |
+|---|---|---|
+| | | |
+
+### robots.txt
+
+- Site: ________ . Its robots.txt says (2 lines): ________
+- Was anything blocked for my bot? What did I do about it?
+
+### Kill and resume
+
+- Run 1: I pressed Ctrl+C after ___ files
+- Run 2: downloaded=___ skipped=___
+- Run 3: downloaded=0 skipped=___
+
+### Capacity (from docs/CAPACITY.md)
+
+- Tokens per page, measured: ___
+- Full corpus: ___ M tokens, ___ chunks, embedding about Rs ___, vectors ___ MB
+- The number that surprised me most, and why (2 lines):
+
+### One thing that went wrong today, and how I fixed it
+
+
+
 ---
 
 ## D07 · File parsing and page storage
@@ -376,3 +410,33 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 - Average per answered question: Rs ___ (my Day 1 target: under Rs 0.50)
 
 ### One thing that went wrong today, and how I fixed it
+
+
+## Day 7 Parser Comparison
+
+| File | HardenHelp parser | Comparison parser |
+|---|---|---|
+
+
+## Day 7 Parser Comparison
+
+| File | HardenHelp parser | Comparison parser |
+|---|---|---|
+| 32161c2f381f_stig_ubuntu2204.yml | SUCCESS: 189 pages, 43,097 chars; preview: '---\npolicy: Canonical Ubuntu 22.04 LTS Security Technical Implementation Guide (STIG)\ntitle: Canonical Ubuntu 22.04 LTS Security Technical Implementat' | Single parser; manual output inspection |
+| cc680acad6d2_rule.yml | SUCCESS: 4 pages, 9,958 chars; preview: 'documentation_complete: true\n\ntitle: \'Modify the System Login Banner\'\n\ndescription: |-\n{{% if product == "rhcos4" %}}\nTo configure the system login ba' | Single parser; manual output inspection |
+| 9ba340158085_rule.yml | SUCCESS: 2 pages, 3,790 chars; preview: "documentation_complete: true\n\ntitle: 'Enable auditd Service'\n\ndescription: |-\nThe <tt>auditd</tt> service is an essential userspace component of\nthe L" | Single parser; manual output inspection |
+| a5a80f497a95_rule.yml | SUCCESS: 2 pages, 3,644 chars; preview: "documentation_complete: true\n\ntitle: 'Ensure auditd Collects File Deletion Events by User'\n\ndescription: |-\nAt a minimum the audit system should colle" | Single parser; manual output inspection |
+| d673964e617b_rule.yml | SUCCESS: 1 pages, 2,722 chars; preview: "documentation_complete: true\n\ntitle: 'Set Account Expiration Following Inactivity in password-auth'\n\ndescription: |-\nVerify the account identifiers (i" | Single parser; manual output inspection |
+| 700e6db64957_rule.yml | SUCCESS: 1 pages, 2,243 chars; preview: "documentation_complete: true\n\ntitle: 'Limit Password Reuse'\n\ndescription: |-\nDo not allow users to reuse recent passwords. This can be\naccomplished by" | Single parser; manual output inspection |
+| 6d9ce8481eb4_rule.yml | SUCCESS: 1 pages, 1,710 chars; preview: 'documentation_complete: true\n\ntitle: \'Disable Avahi Server Software\'\n\ndescription: |-\n{{{ describe_service_disable(service="avahi-daemon") }}}\n\nration' | Single parser; manual output inspection |
+| 38e24efc4f21_rule.yml | SUCCESS: 1 pages, 1,606 chars; preview: 'documentation_complete: true\n\ntitle: Verify pam_unix module is activated\n\ndescription: |-\n<tt>pam_unix</tt> is the standard Unix authentication module' | Single parser; manual output inspection |
+| 2d489e1253dc_rule.yml | SUCCESS: 1 pages, 642 chars; preview: "documentation_complete: true\n\ntitle: 'Use HTTPS for Repositories in /etc/apt/sources.list'\n\ndescription: |-\nActive APT repository entries in <tt>/etc/" | Single parser; manual output inspection |
+| f2742d7e57d5_sysctl_kernel_kptr_restrict_value.var | SUCCESS: 1 pages, 206 chars; preview: "documentation_complete: true\n\ntitle: kernel.kptr_restrict\n\ndescription: 'Configure exposition of kernel pointer addresses '\n\ntype: number\n\noperator: e" | Single parser; manual output inspection |
+
+
+## Day 7 Parser Comparison
+
+| File | HardenHelp parser | Comparison parser |
+|---|---|---|
+| sample.pdf | SUCCESS: 1 pages, 74 chars; preview: 'Security Guide\nKeep your Ubuntu system updated.\nUse strong authentication.' | PyMuPDF: SUCCESS: 1 pages, 75 chars; pypdf: SUCCESS: 1 pages, 74 chars |
+| sample.html | SUCCESS: 1 pages, 74 chars; preview: 'Security Guide\nKeep your Ubuntu system updated.\nUse strong authentication.' | Trafilatura: SUCCESS: 74 chars; tag stripping: SUCCESS: 91 chars |
