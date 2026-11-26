@@ -440,3 +440,63 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 |---|---|---|
 | sample.pdf | SUCCESS: 1 pages, 74 chars; preview: 'Security Guide\nKeep your Ubuntu system updated.\nUse strong authentication.' | PyMuPDF: SUCCESS: 1 pages, 75 chars; pypdf: SUCCESS: 1 pages, 74 chars |
 | sample.html | SUCCESS: 1 pages, 74 chars; preview: 'Security Guide\nKeep your Ubuntu system updated.\nUse strong authentication.' | Trafilatura: SUCCESS: 74 chars; tag stripping: SUCCESS: 91 chars |
+
+
+### D08 · LLM gateway
+
+- Primary: gemini-3.8-flash (Gemini) · fallback: openai/gpt-oss-20b (Groq)
+- First question on my laptop: first words after ___ s, total ___ s, tokens in ___ / out ___, cost Rs ___
+- Same question on my live URL (second, awake request): first words after ___ s. Day 1 target: under 1.5 s
+
+### Tokens: English against Tamil
+
+| Message | tokens in |
+|---|---|
+| "Hi" (baseline: mostly my system prompt) | |
+| The English sentence | |
+| The same sentence in Tamil | |
+
+- The Tamil message needs about ___ times the tokens of the English one.
+
+### What the model does without my documents
+
+- Question 6 ("Is our production server compliant right now?"): did it admit it can't know? Its exact words:
+- A detail it got wrong or invented (question → what it said → what is true):
+- The off-topic question: did it decline in one sentence?
+
+### Fallback and circuit breaker
+
+- With the primary broken: provider ________ , fallback ____ , first words after ___ s
+- The question at which "llm call gemini … error" stopped appearing in the log: number ___
+
+### The bill
+
+- /v1/usage today: calls ___ , errors ___ , fallbacks ___ , cost Rs ___
+- Average per answered question: Rs ___ (my Day 1 target: under Rs 0.50)
+
+### One thing that went wrong today, and how I fixed it
+
+
+### D09 · Prompts and structured output
+
+- My best router prompt: classify_v__ with ___ / 20
+- What I changed in v4, and what happened to the score:
+- The question my best version still gets wrong (line, wanted, got), and why I think so:
+- A label in my test set that I changed after seeing the results (or "none"):
+- Input tokens per question: v1 ___ , best version ___ . Is the extra accuracy worth it?
+
+### My contract (DocMeta)
+
+- Fields I kept from my project card:
+- Fields I deleted, and why they make no sense per document:
+- The field I tightened, and how:
+
+### Extraction run
+
+- Prompt version: extract_v__ · documents: ___ ok, ___ repaired, ___ failed (of ___ parsed)
+- Not finished? Why, and how many are left:
+- Most common failure reason, and what I did about it:
+- A record that was valid but wrong (document, field, what it said, what is true):
+- Cost at list price: Rs ___ in total, Rs ___ per document
+
+### One thing that went wrong today, and how I fixed it

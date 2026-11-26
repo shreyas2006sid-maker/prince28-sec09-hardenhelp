@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ PRICES_USD = {
     "openai/gpt-oss-20b": (0.075, 0.30),
     "openai/gpt-oss-120b": (0.15, 0.60),
 }
-MAX_WAIT = 20.0  # never sleep longer than this between two attempts
+MAX_WAIT = 300.0  # allow provider-requested recovery delays up to five minutes
 
 Message = dict[str, str]
 Recorder = Callable[[dict], Awaitable[None]]
@@ -100,20 +101,68 @@ class OpenAICompatProvider:
         # 10 s to connect; `timeout` seconds of silence at most while the answer arrives
         self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0))
 
-    def _body(self, messages: list[Message], temperature: float, stream: bool) -> dict:
-        body = {"model": self.model, "messages": messages, "temperature": temperature}
+    def _body(
+        self,
+        messages: list[Message],
+        temperature: float,
+        stream: bool,
+        response_format: dict | None = None,
+    ) -> dict:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
         if stream:
             body |= {"stream": True, "stream_options": {"include_usage": True}}
+
+        if response_format:
+            body["response_format"] = response_format
+
+        if self.name == "groq" and self.model.startswith("openai/gpt-oss-"):
+            body["max_completion_tokens"] = 4096
+            body["reasoning_effort"] = "low"
+            body["include_reasoning"] = False
+
         return body
 
     @staticmethod
     def _error(response: httpx.Response) -> LLMError:
         code = response.status_code
         wait = response.headers.get("retry-after", "")
+
+        retry_after = float(wait) if wait.replace(".", "", 1).isdigit() else None
+
+        if code == 429 and retry_after is None:
+            try:
+                error_data = response.json()
+                message = error_data.get("error", {}).get("message", "")
+
+                match = re.search(
+                    r"try again in\s+"
+                    r"(?:(?P<hours>[0-9]+(?:\.[0-9]+)?)h)?"
+                    r"(?:(?P<minutes>[0-9]+(?:\.[0-9]+)?)m)?"
+                    r"(?:(?P<seconds>[0-9]+(?:\.[0-9]+)?)s)?",
+                    message,
+                    re.IGNORECASE,
+                )
+
+                if match and any(match.group(unit) for unit in ("hours", "minutes", "seconds")):
+                    retry_after = (
+                        float(match.group("hours") or 0) * 3600
+                        + float(match.group("minutes") or 0) * 60
+                        + float(match.group("seconds") or 0)
+                        + 1.0
+                    )
+
+            except (ValueError, AttributeError, TypeError):
+                pass
+
         return LLMError(
-            f"HTTP {code}: {response.text[:200]}",
-            retryable=code in {408, 429} or code >= 500,  # 400, 401, 404 will not heal
-            retry_after=float(wait) if wait.replace(".", "", 1).isdigit() else None,
+            f"HTTP {code}: {response.text[:1500]}",
+            retryable=code in {408, 429} or code >= 500,
+            retry_after=retry_after,
         )
 
     @staticmethod
@@ -123,8 +172,14 @@ class OpenAICompatProvider:
         timed_out = isinstance(exc, httpx.TimeoutException)
         return LLMError(type(exc).__name__, retryable=not timed_out)
 
-    async def generate(self, messages: list[Message], *, temperature: float = 0.2) -> Reply:
-        body = self._body(messages, temperature, stream=False)
+    async def generate(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float = 0.2,
+        response_format: dict | None = None,
+    ) -> Reply:
+        body = self._body(messages, temperature, False, response_format)
         try:
             response = await self._client.post(self._url, headers=self._headers, json=body)
         except httpx.TransportError as exc:
@@ -140,7 +195,7 @@ class OpenAICompatProvider:
         self, messages: list[Message], usage: Reply, *, temperature: float = 0.2
     ) -> AsyncIterator[str]:
         """Yield the answer piece by piece (server-sent events). Fills `usage` at the end."""
-        body = self._body(messages, temperature, stream=True)
+        body = self._body(messages, temperature, True)
         try:
             async with self._client.stream(
                 "POST", self._url, headers=self._headers, json=body
@@ -175,19 +230,22 @@ class FakeLLM:
     """A scripted provider for tests: no network, no bill.
 
     `script` holds what each call does, in order: a string is the answer, an exception is
-    raised, and ("partial", error) streams half an answer and then fails.
+    raised, and ("partial", error) streams half an answer and then fails. `seen` remembers
+    what the model was asked, so a test can check the messages and options.
     """
 
     def __init__(self, name: str = "fake", model: str = "fake-1", script: list | None = None):
         self.name, self.model = name, model
         self.script = list(script or [])
         self.calls = 0
+        self.seen: list[dict] = []
 
     def _next(self) -> object:
         self.calls += 1
         return self.script.pop(0) if self.script else "A fake answer."
 
-    async def generate(self, messages: list[Message], *, temperature: float = 0.2) -> Reply:
+    async def generate(self, messages: list[Message], **options) -> Reply:
+        self.seen.append({"messages": messages, **options})
         item = self._next()
         if isinstance(item, Exception):
             raise item
