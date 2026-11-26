@@ -1,6 +1,13 @@
-"""Polite, resumable downloader for approved HardenHelp sources."""
+"""Polite, resumable downloader for your corpus.
 
-from __future__ import annotations
+The rules it follows, in order:
+1. Ask robots.txt first (RFC 9309). Not allowed means never requested.
+2. At most `max_concurrency` downloads at once, and a pause between two requests to one site.
+3. A timeout on every request. Only errors that can heal are retried (429, 5xx, network),
+   with exponential backoff + jitter, and Retry-After is obeyed.
+4. Write to <name>.part and rename when complete: a killed run never leaves a half file.
+5. One line per file in data/manifest.jsonl, so the next run skips what is already there.
+"""
 
 import asyncio
 import csv
@@ -8,611 +15,355 @@ import hashlib
 import json
 import random
 import re
-import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from protego import Protego
 
-USER_AGENT = (
-    "examate-student-bot/0.1 "
-    "(student project; +https://github.com/shreyas2006sid-maker/prince28-sec09-hardenhelp)"
-)
+# Say who you are and where to complain. Site owners see this in their logs.
+CONTACT = "https://github.com/YOUR-GITHUB-USERNAME/prince28-sec09-hardenhelp"
+ROBOTS_TOKEN = "examate-student-bot"  # the name robots.txt rules are matched against
+USER_AGENT = f"{ROBOTS_TOKEN}/0.1 (student project; +{CONTACT})"
 
-TIMEOUT = httpx.Timeout(30.0, connect=10.0)
-MAX_CONCURRENCY = 4
+RETRYABLE = {408, 425, 429, 500, 502, 503, 504}  # these can heal; 403 or 404 will not
+MAX_WAIT = 120.0  # never sleep longer than this between attempts
+MAX_BYTES = 200 * 1024 * 1024  # refuse files above 200 MB
+ATTEMPT_TIMEOUT = 300.0  # one attempt may take at most 5 minutes in total
+KNOWN_EXT = {
+    ".pdf", ".html", ".htm", ".json", ".txt", ".md", ".mdx", ".rst", ".adoc", ".csv",
+    ".xml", ".yaml", ".yml", ".zip", ".docx", ".xlsx", ".xls",
+}  # fmt: skip
+EXT_BY_TYPE = {
+    "application/pdf": ".pdf",
+    "text/html": ".html",
+    "application/json": ".json",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "application/zip": ".zip",
+    "application/yaml": ".yaml",
+}
+
+Sleep = Callable[[float], Awaitable[None]]
 
 
 @dataclass(frozen=True)
 class Source:
-    """One source from the CSV inventory."""
-
     url: str
-    source: str
-    licence: str
-    title: str
+    source: str  # short name of the publisher: becomes the folder data/raw/<source>/
+    licence: str  # licence or terms of use. Never empty: no licence, no download.
+    title: str = ""
 
 
-def read_sources(csv_path: Path) -> list[Source]:
-    """Read source records while ignoring comment lines."""
-
-    with Path(csv_path).open("r", encoding="utf-8-sig", newline="") as file:
-        lines = (line for line in file if line.strip() and not line.lstrip().startswith("#"))
-
-        reader = csv.DictReader(lines)
-
-        required = {"url", "source", "licence", "title"}
-
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError("CSV must contain url, source, licence, and title columns.")
-
-        sources = []
-
-        for row in reader:
-            if not row.get("url", "").strip():
-                continue
-
-            sources.append(
-                Source(
-                    url=row["url"].strip(),
-                    source=row["source"].strip(),
-                    licence=row["licence"].strip(),
-                    title=row["title"].strip(),
-                )
-            )
-
-    return sources
+class DownloadError(Exception):
+    def __init__(self, message: str, *, code: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
 
 
-def licence_is_approved(source: Source) -> bool:
-    """Allow only explicitly identified BSD-3-Clause ComplianceAsCode records."""
-
-    return (
-        source.source.casefold() == "complianceascode"
-        and "bsd-3-clause" in source.licence.casefold()
-    )
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def download_url(url: str) -> str:
-    """Convert supported GitHub blob URLs to raw file URLs."""
-
-    parsed = urlsplit(url)
-
-    if parsed.scheme != "https" or parsed.hostname != "github.com":
-        return url
-
-    match = re.fullmatch(
-        r"/([^/]+)/([^/]+)/blob/(main|master)/(.+)",
-        parsed.path,
-    )
-
-    if not match:
-        return url
-
-    owner, repository, branch, file_path = match.groups()
-
-    return urlunsplit(
-        (
-            "https",
-            "raw.githubusercontent.com",
-            f"/{owner}/{repository}/{branch}/{file_path}",
-            parsed.query,
-            "",
-        )
-    )
+def slug(text: str, limit: int = 60) -> str:
+    """Lowercase letters, digits and dashes only: safe on Windows, Mac and Linux."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:limit] or "file"
 
 
-def safe_source_dir(source: str) -> str:
-    """Generate a filesystem-safe directory name for a source."""
+def file_stem(url: str) -> str:
+    """A stable file name for a URL: a readable part + 8 characters of the URL's hash."""
+    parts = urlsplit(url)
+    last = unquote(parts.path.rstrip("/").rsplit("/", 1)[-1]) or parts.netloc
+    name = last.rsplit(".", 1)[0] if "." in last else last
+    return f"{slug(name)}-{hashlib.sha256(url.encode()).hexdigest()[:8]}"
 
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", source.strip())
-    return cleaned.strip("._-") or "unknown-source"
+
+def pick_ext(url: str, content_type: str) -> str:
+    suffix = Path(urlsplit(url).path).suffix.lower()
+    if suffix in KNOWN_EXT:
+        return suffix
+    return EXT_BY_TYPE.get(content_type.split(";")[0].strip().lower(), ".bin")
 
 
-def safe_filename(url: str) -> str:
-    """Generate a filesystem-safe, URL-specific filename."""
-
-    parsed = urlsplit(url)
-    name = Path(parsed.path).name or "download"
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-
-    return f"{digest}_{name}"
+def backoff_delay(attempt: int, *, base: float = 1.0, cap: float = 60.0) -> float:
+    """Exponential backoff with full jitter: random between 0 and min(cap, base * 2^attempt)."""
+    return random.uniform(0, min(cap, base * 2**attempt))
 
 
 def retry_after_seconds(value: str | None) -> float | None:
-    """Parse a Retry-After header as seconds or an HTTP date."""
-
+    """The Retry-After header is either seconds ("120") or an HTTP date."""
     if not value:
         return None
-
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
     try:
-        return max(0.0, float(value))
-
-    except ValueError:
-        try:
-            retry_time = parsedate_to_datetime(value)
-
-            if retry_time.tzinfo is None:
-                retry_time = retry_time.replace(tzinfo=UTC)
-
-            return max(
-                0.0,
-                (retry_time - datetime.now(UTC)).total_seconds(),
-            )
-
-        except (TypeError, ValueError, OverflowError):
-            return None
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
-def retry_delay(attempt: int, retry_after: float | None = None) -> float:
-    """Calculate exponential backoff with jitter."""
-
-    if retry_after is not None:
-        return retry_after
-
-    return min(60.0, 2**attempt) + random.uniform(0.0, 1.0)
-
-
-def is_retryable_status(status: int) -> bool:
-    """Identify HTTP statuses that can be retried."""
-
-    return status in {408, 425, 429} or 500 <= status <= 599
-
-
-def validate_content_type(content_type: str) -> None:
-    """Reject HTML responses instead of saving webpages as source files."""
-
-    media_type = content_type.split(";", maxsplit=1)[0].strip().casefold()
-
-    if media_type in {"text/html", "application/xhtml+xml"}:
-        raise ValueError("Server returned HTML instead of a source file.")
+def read_sources(path: Path) -> list[Source]:
+    """Read data/sources.csv (url, source, licence, title). Lines starting with # are notes."""
+    sources: list[Source] = []
+    seen: set[str] = set()
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        lines = (ln for ln in handle if ln.strip() and not ln.lstrip().startswith("#"))
+        for number, row in enumerate(csv.DictReader(lines), start=1):
+            url = (row.get("url") or "").strip()
+            name = (row.get("source") or "").strip()
+            licence = (row.get("licence") or "").strip()
+            if urlsplit(url).scheme not in {"http", "https"}:
+                raise ValueError(f"sources row {number}: not an http(s) URL: {url!r}")
+            if not name or not licence:
+                raise ValueError(f"sources row {number}: source and licence are required: {url}")
+            if url not in seen:
+                seen.add(url)
+                sources.append(Source(url, name, licence, (row.get("title") or "").strip()))
+    return sources
 
 
-def looks_like_html(content: bytes) -> bool:
-    """Check the beginning of a response for common HTML markers."""
+class Manifest:
+    """Append-only log: one JSON line per file. The newest line for a URL wins."""
 
-    prefix = content[:1024].lstrip().lower()
-
-    return (
-        prefix.startswith(b"<!doctype html")
-        or prefix.startswith(b"<html")
-        or prefix.startswith(b"<head")
-        or prefix.startswith(b"<body")
-    )
-
-
-def validate_content_range(value: str, offset: int) -> int:
-    """Validate Content-Range and return the expected number of bytes."""
-
-    match = re.fullmatch(
-        r"bytes (\d+)-(\d+)/(\d+|\*)",
-        value.strip(),
-        flags=re.IGNORECASE,
-    )
-
-    if not match:
-        raise ValueError("Server returned an invalid Content-Range header.")
-
-    start, end, total = match.groups()
-
-    start_number = int(start)
-    end_number = int(end)
-
-    if offset < 0 or start_number != offset or end_number < start_number:
-        raise ValueError("Server returned an unexpected partial range.")
-
-    if total != "*" and end_number >= int(total):
-        raise ValueError("Server returned an invalid total range size.")
-
-    return end_number - start_number + 1
-
-
-class Downloader:
-    """Download approved files with robots checks and resumable partial files."""
-
-    def __init__(
-        self,
-        output_dir: Path,
-        manifest_path: Path,
-        delay: float = 1.0,
-        max_concurrency: int = 4,
-        max_attempts: int = 4,
-    ) -> None:
-        if delay < 0:
-            raise ValueError("delay cannot be negative")
-
-        if not 1 <= max_concurrency <= MAX_CONCURRENCY:
-            raise ValueError("max_concurrency must be between 1 and 4")
-
-        if max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
-
-        self.output_dir = Path(output_dir)
-        self.manifest_path = Path(manifest_path)
-
-        self.delay = delay
-        self.max_attempts = max_attempts
-
-        self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.manifest_lock = asyncio.Lock()
-
-        self.client: httpx.AsyncClient | None = None
-
-        self.robots_cache: dict[str, Protego | bool] = {}
-        self.robots_locks: dict[str, asyncio.Lock] = {}
-
-        self.host_locks: dict[str, asyncio.Lock] = {}
-        self.last_request: dict[str, float] = {}
-
-        self.completed: dict[str, str] = {}
-
-        self.counts = {
-            "downloaded": 0,
-            "skipped": 0,
-            "blocked": 0,
-            "failed": 0,
-        }
-
-        self._load_manifest()
-
-    async def __aenter__(self) -> Downloader:
-        """Create output directories and open the HTTP client."""
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.client = httpx.AsyncClient(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Encoding": "identity",
-            },
-            timeout=TIMEOUT,
-            follow_redirects=True,
-        )
-
-        return self
-
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
-        """Close the HTTP client."""
-
-        if self.client is not None:
-            await self.client.aclose()
-
-    def _load_manifest(self) -> None:
-        """Load previously completed downloads."""
-
-        if not self.manifest_path.exists():
-            return
-
-        with self.manifest_path.open("r", encoding="utf-8") as file:
-            for line in file:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.records: dict[str, dict] = {}
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            for line in text.splitlines():
                 try:
                     record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # an empty line, or a line cut off when a run was killed
+                self.records[record["url"]] = record
+            if text and not text.endswith("\n"):  # repair a cut-off last line
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n")
 
-                    if record.get("status") != "downloaded":
-                        continue
+    def done(self, url: str, root: Path) -> bool:
+        record = self.records.get(url)
+        return bool(
+            record and record["status"] == "downloaded" and (root / record["path"]).is_file()
+        )
 
-                    url = record.get("url")
-                    path = record.get("path")
+    def add(self, record: dict) -> None:
+        self.records[record["url"]] = record
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-                    if url and path and Path(path).is_file():
-                        self.completed[url] = path
 
-                except (json.JSONDecodeError, OSError):
-                    continue
+class Robots:
+    """robots.txt for each site: fetched once per run, applied the RFC 9309 way."""
 
-    async def _robots_allowed(self, url: str) -> bool:
-        """Check robots.txt using Protego and fail closed when unavailable."""
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+        self._rules: dict[str, Protego | None] = {}  # None = unreachable: allow nothing
+        self._locks: dict[str, asyncio.Lock] = {}
 
-        parsed = urlsplit(url)
-
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-
-        robots_url = urlunsplit((parsed.scheme, parsed.netloc, "/robots.txt", "", ""))
-
-        lock = self.robots_locks.setdefault(origin, asyncio.Lock())
-
-        async with lock:
-            if origin not in self.robots_cache:
-                policy: Protego | bool = False
-
-                try:
-                    assert self.client is not None
-
-                    await self._wait_for_host(parsed.netloc)
-
-                    response = await self.client.get(robots_url)
-
-                    if response.status_code == 404:
-                        # No robots.txt means there are no published crawler rules.
-                        policy = True
-
-                    elif response.status_code == 200:
-                        policy = Protego.parse(response.text)
-
-                    else:
-                        # 403, 429, 5xx and unexpected responses fail closed.
-                        policy = False
-
-                except (httpx.HTTPError, ValueError):
-                    # Network errors and invalid robots content fail closed.
-                    policy = False
-
-                self.robots_cache[origin] = policy
-
-            policy = self.robots_cache[origin]
-
-        if policy is True:
-            return True
-
-        if policy is False:
-            return False
-
-        return policy.can_fetch(url, USER_AGENT)
-
-    async def _wait_for_host(self, host: str) -> None:
-        """Enforce a minimum delay between requests to the same host."""
-
-        lock = self.host_locks.setdefault(host, asyncio.Lock())
-
-        async with lock:
-            previous = self.last_request.get(host, 0.0)
-
-            elapsed = time.monotonic() - previous
-            remaining = self.delay - elapsed
-
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-
-            self.last_request[host] = time.monotonic()
-
-    async def _write_manifest(self, record: dict) -> None:
-        """Append a manifest record safely."""
-
-        async with self.manifest_lock:
-            with self.manifest_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(record) + "\n")
-
-    async def download(self, source: Source) -> dict:
-        """Download one approved source and record its result."""
-
-        url = source.url
-
-        if not licence_is_approved(source):
-            self.counts["blocked"] += 1
-
-            return {
-                "url": url,
-                "status": "blocked",
-                "error": "Redistribution licence has not been approved.",
-            }
-
-        if url in self.completed and Path(self.completed[url]).is_file():
-            self.counts["skipped"] += 1
-
-            return {
-                "url": url,
-                "status": "skipped",
-            }
-
-        fetch_url = download_url(url)
-
-        if not await self._robots_allowed(fetch_url):
-            self.counts["blocked"] += 1
-
-            return {
-                "url": url,
-                "status": "blocked",
-                "error": ("Robots policy unavailable or downloading disallowed."),
-            }
-
-        destination = self.output_dir / safe_source_dir(source.source) / safe_filename(url)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-
-        part_file = destination.with_name(destination.name + ".part")
-
-        host = urlsplit(fetch_url).netloc
-
+    async def _load(self, origin: str) -> Protego | None:
         try:
-            async with self.semaphore:
-                for attempt in range(self.max_attempts):
-                    await self._wait_for_host(host)
+            response = await self._client.get(origin + "/robots.txt")
+        except httpx.HTTPError:
+            return None  # unreachable: assume everything is disallowed
+        if response.status_code == 429 or response.status_code >= 500:
+            return None  # the server is struggling: assume everything is disallowed
+        if response.status_code >= 400:
+            return Protego.parse("")  # no robots.txt: nothing is disallowed
+        return Protego.parse(response.text)
 
-                    try:
-                        assert self.client is not None
+    async def check(self, url: str) -> tuple[bool, float]:
+        """Return (allowed?, the crawl delay the site asks for in seconds)."""
+        parts = urlsplit(url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        async with self._locks.setdefault(origin, asyncio.Lock()):
+            if origin not in self._rules:
+                self._rules[origin] = await self._load(origin)
+        rules = self._rules[origin]
+        if rules is None:
+            return False, 0.0
+        return rules.can_fetch(url, ROBOTS_TOKEN), float(rules.crawl_delay(ROBOTS_TOKEN) or 0.0)
 
-                        original_size = part_file.stat().st_size if part_file.exists() else 0
 
-                        offset = original_size
-                        headers = {}
+class HostGate:
+    """Politeness: leave a gap between two requests to the same site."""
 
-                        if offset:
-                            headers["Range"] = f"bytes={offset}-"
+    def __init__(self, delay: float, sleep: Sleep) -> None:
+        self._delay = delay
+        self._sleep = sleep
+        self._next_ok: dict[str, float] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
-                        async with self.client.stream(
-                            "GET",
-                            fetch_url,
-                            headers=headers,
-                        ) as response:
-                            if (
-                                is_retryable_status(response.status_code)
-                                and attempt + 1 < self.max_attempts
-                            ):
-                                wait = retry_delay(
-                                    attempt,
-                                    retry_after_seconds(response.headers.get("Retry-After")),
-                                )
+    async def wait(self, host: str, crawl_delay: float = 0.0) -> None:
+        async with self._locks.setdefault(host, asyncio.Lock()):
+            pause = self._next_ok.get(host, 0.0) - time.monotonic()
+            if pause > 0:
+                await self._sleep(pause)
+            self._next_ok[host] = time.monotonic() + max(self._delay, crawl_delay)
 
-                                await asyncio.sleep(wait)
-                                continue
 
-                            response.raise_for_status()
+def make_client(max_concurrency: int = 4) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT},
+        timeout=httpx.Timeout(30.0, connect=10.0),  # 10 s to connect, 30 s of silence at most
+        limits=httpx.Limits(max_connections=max_concurrency),
+        follow_redirects=True,
+    )
 
-                            validate_content_type(response.headers.get("Content-Type", ""))
 
-                            expected_bytes = None
+async def _download(client: httpx.AsyncClient, src: Source, root: Path, raw_dir: Path) -> dict:
+    """One attempt. Streams to <name>.part, renames when complete, returns the manifest fields."""
+    async with client.stream("GET", src.url) as response:
+        if response.status_code != 200:
+            raise DownloadError(
+                f"HTTP {response.status_code}",
+                code=response.status_code,
+                retry_after=retry_after_seconds(response.headers.get("Retry-After")),
+            )
+        content_type = response.headers.get("Content-Type", "")
+        name = file_stem(src.url) + pick_ext(src.url, content_type)
+        target = raw_dir / slug(src.source) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        part = target.with_name(name + ".part")
+        digest, size = hashlib.sha256(), 0
+        try:
+            with part.open("wb") as handle:  # small blocking writes are fine at this scale
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise DownloadError(f"larger than {MAX_BYTES // 2**20} MB")
+                    digest.update(chunk)
+                    handle.write(chunk)
+            part.replace(target)  # atomic: the final name appears only when the file is whole
+        finally:
+            part.unlink(missing_ok=True)
+    return {
+        "path": target.relative_to(root).as_posix(),
+        "bytes": size,
+        "sha256": digest.hexdigest(),
+        "content_type": content_type.split(";")[0].strip(),
+        "http_status": 200,
+    }
 
-                            if response.status_code == 206:
-                                if not offset:
-                                    raise ValueError(
-                                        "Server returned partial content without a resume request."
-                                    )
 
-                                expected_bytes = validate_content_range(
-                                    response.headers.get("Content-Range", ""),
-                                    offset,
-                                )
-
-                                mode = "ab"
-                                download_file = part_file
-
-                            elif offset:
-                                mode = "wb"
-
-                                download_file = part_file.with_name(part_file.name + ".restart")
-
-                            else:
-                                mode = "wb"
-                                download_file = part_file
-
-                            received_bytes = 0
-                            first_chunk = True
-
-                            try:
-                                with download_file.open(mode) as file:
-                                    async for chunk in response.aiter_raw():
-                                        if first_chunk:
-                                            first_chunk = False
-
-                                            if looks_like_html(chunk):
-                                                raise ValueError(
-                                                    "Server returned HTML instead of a source file."
-                                                )
-
-                                        file.write(chunk)
-                                        received_bytes += len(chunk)
-
-                                if expected_bytes is not None and received_bytes != expected_bytes:
-                                    with part_file.open("r+b") as file:
-                                        file.truncate(original_size)
-
-                                    raise ValueError(
-                                        "Downloaded byte count does not match Content-Range."
-                                    )
-
-                                if not download_file.exists() or download_file.stat().st_size == 0:
-                                    raise ValueError("Downloaded file is empty.")
-
-                                if download_file != part_file:
-                                    download_file.replace(part_file)
-
-                            except BaseException:
-                                if download_file != part_file:
-                                    download_file.unlink(missing_ok=True)
-
-                                raise
-
-                        # Atomic rename after the download is complete.
-                        part_file.replace(destination)
-
-                        result = {
-                            "url": url,
-                            "download_url": fetch_url,
-                            "path": str(destination),
-                            "source": source.source,
-                            "licence": source.licence,
-                            "title": source.title,
-                            "status": "downloaded",
-                            "downloaded_at": datetime.now(UTC).isoformat(),
-                        }
-
-                        await self._write_manifest(result)
-
-                        self.completed[url] = str(destination)
-                        self.counts["downloaded"] += 1
-
-                        return result
-
-                    except httpx.TransportError:
-                        if attempt + 1 >= self.max_attempts:
-                            raise
-
-                        await asyncio.sleep(retry_delay(attempt))
-
-            raise RuntimeError("Download attempts exhausted.")
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as error:
-            self.counts["failed"] += 1
-
-            return {
-                "url": url,
-                "status": "failed",
-                "error": str(error),
-            }
-
-    async def download_many(
-        self,
-        sources: list[Source],
-        on_result: Callable[[dict], None] | None = None,
-    ) -> list[dict]:
-        """Download multiple sources and optionally report each result."""
-
-        async def process(source: Source) -> dict:
-            result = await self.download(source)
-
-            if on_result is not None:
-                on_result(result)
-
-            return result
-
-        return await asyncio.gather(*(process(source) for source in sources))
+async def fetch_one(
+    client: httpx.AsyncClient,
+    src: Source,
+    *,
+    root: Path,
+    raw_dir: Path,
+    robots: Robots,
+    gate: HostGate,
+    slots: asyncio.Semaphore,
+    max_attempts: int,
+    sleep: Sleep,
+) -> dict:
+    """Download one source with retries. Always returns a manifest record, never raises."""
+    record = {
+        "url": src.url,
+        "source": src.source,
+        "licence": src.licence,
+        "title": src.title,
+        "via": "http",
+    }
+    allowed, crawl_delay = await robots.check(src.url)
+    if not allowed:
+        return record | {"status": "blocked", "error": "robots.txt", "fetched_at": now_iso()}
+    host = urlsplit(src.url).netloc
+    error, code, attempt = "", None, 0
+    for attempt in range(1, max_attempts + 1):
+        wait = backoff_delay(attempt - 1)
+        async with slots:  # at most N downloads at the same time
+            await gate.wait(host, crawl_delay)
+            try:
+                async with asyncio.timeout(ATTEMPT_TIMEOUT):
+                    fields = await _download(client, src, root, raw_dir)
+                done = {"status": "downloaded", "attempts": attempt, "fetched_at": now_iso()}
+                return record | fields | done
+            except DownloadError as exc:
+                error, code = str(exc), exc.code
+                if code not in RETRYABLE:
+                    break  # 403, 404, too large: trying again will not help
+                if exc.retry_after is not None:
+                    if exc.retry_after > MAX_WAIT:
+                        error = f"{error}: asked to wait {exc.retry_after:.0f} s, run again later"
+                        break
+                    wait = max(wait, exc.retry_after)  # the server's wish is the minimum
+            except (httpx.TransportError, TimeoutError) as exc:  # timeout, DNS, reset
+                error, code = type(exc).__name__, None
+            except httpx.HTTPError as exc:  # e.g. too many redirects: not worth retrying
+                error, code = type(exc).__name__, None
+                break
+        if attempt < max_attempts:
+            await sleep(min(wait, MAX_WAIT))  # outside the slot: others keep working
+    failed = {"status": "failed", "http_status": code, "error": error, "attempts": attempt}
+    return record | failed | {"fetched_at": now_iso()}
 
 
 async def fetch_all(
     sources: list[Source],
-    root: Path,
+    *,
+    root: Path = Path("."),
     max_concurrency: int = 4,
-    per_host_delay: float = 1.0,
+    per_host_delay: float = 0.5,
     max_attempts: int = 4,
+    client: httpx.AsyncClient | None = None,
+    sleep: Sleep = asyncio.sleep,
     on_result: Callable[[dict], None] | None = None,
 ) -> dict[str, int]:
-    """Download approved sources into data/raw and return summary counts."""
-
-    project_root = Path(root)
-
-    output_dir = project_root / "data" / "raw"
-
-    manifest_path = project_root / "data" / "manifest.jsonl"
-
-    # Preserve the existing manifest when moving to the required location.
-    legacy_manifest = output_dir / "manifest.jsonl"
-
-    if not manifest_path.exists() and legacy_manifest.is_file():
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        shutil.copy2(
-            legacy_manifest,
-            manifest_path,
-        )
-
-    async with Downloader(
-        output_dir=output_dir,
-        manifest_path=manifest_path,
-        delay=per_host_delay,
-        max_concurrency=max_concurrency,
-        max_attempts=max_attempts,
-    ) as downloader:
-        await downloader.download_many(sources, on_result)
-
-        return downloader.counts.copy()
+    """Download every source that is not already done. Returns the counts per status."""
+    raw_dir = root / "data" / "raw"
+    manifest = Manifest(root / "data" / "manifest.jsonl")
+    todo = [src for src in sources if not manifest.done(src.url, root)]
+    counts = {"downloaded": 0, "skipped": len(sources) - len(todo), "blocked": 0, "failed": 0}
+    own_client = client is None
+    client = client or make_client(max_concurrency)
+    robots = Robots(client)
+    gate = HostGate(per_host_delay, sleep)
+    slots = asyncio.Semaphore(max_concurrency)
+    try:
+        tasks = [
+            asyncio.create_task(
+                fetch_one(
+                    client,
+                    src,
+                    root=root,
+                    raw_dir=raw_dir,
+                    robots=robots,
+                    gate=gate,
+                    slots=slots,
+                    max_attempts=max_attempts,
+                    sleep=sleep,
+                )
+            )
+            for src in todo
+        ]
+        for finished in asyncio.as_completed(tasks):
+            record = await finished
+            counts[record["status"]] += 1
+            before = manifest.records.get(record["url"], {})
+            same_problem = (before.get("status"), before.get("error")) == (
+                record["status"],
+                record.get("error"),
+            )
+            if record["status"] == "downloaded" or not same_problem:
+                manifest.add(record)  # written at once: a kill loses only the files in flight
+            if on_result:
+                on_result(record)
+    finally:
+        if own_client:
+            await client.aclose()
+    return counts

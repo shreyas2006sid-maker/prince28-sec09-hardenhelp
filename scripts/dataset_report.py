@@ -1,437 +1,250 @@
-"""Generate DATASET.md and docs/CAPACITY.md from the current corpus."""
+"""Write DATASET.md (where every file came from) and docs/CAPACITY.md (what the full corpus costs).
+
+  uv run python scripts/dataset_report.py --full-pages 3000
+  uv run python scripts/dataset_report.py --full-files 2500    if your target counts files
+
+Only the part between the two "generated" markers is replaced, so your own notes stay.
+"""
 
 import argparse
-import csv
 import json
-from collections import Counter
+import logging
+import sys
+from collections import defaultdict
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
-from hardenhelp.ingest.parse import ParseError, parse_file
+from pypdf import PdfReader
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MANIFEST = ROOT / "data" / "raw" / "manifest.jsonl"
-SOURCES_FILE = ROOT / "data" / "sources.csv"
+MANIFEST = Path("data/manifest.jsonl")
+CACHE = Path("data/raw/.measured.json")  # so a second run is instant
+START, END = "<!-- generated:start -->", "<!-- generated:end -->"
+TEXT_EXT = {
+    ".md", ".mdx", ".markdown", ".txt", ".rst", ".adoc", ".sgml", ".json", ".yaml", ".yml",
+    ".csv", ".xml", ".py",
+}  # fmt: skip
+CHARS_PER_PAGE = 3000  # about 500 English words: one printed page
+CHARS_PER_TOKEN = 4  # rule of thumb for English; you count real tokens on Day 8
+PDF_SAMPLE = 5  # pages read per PDF to estimate its text
+OVERLAP = 1.15  # chunks overlap by about 15% (you choose the real value on Day 11)
 
-
-def load_manifest(path: Path) -> list[dict]:
-    """Load all manifest records."""
-    if not path.is_file():
-        raise FileNotFoundError(f"Manifest not found: {path}")
-
-    records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            records.append(json.loads(line))
-    return records
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
-def load_sources() -> list[dict]:
-    """Load the source inventory."""
-    if not SOURCES_FILE.is_file():
-        raise FileNotFoundError(f"Source inventory not found: {SOURCES_FILE}")
+class VisibleText(HTMLParser):
+    """Counts the characters a reader would see: no tags, scripts or styles."""
 
-    lines = SOURCES_FILE.read_text(encoding="utf-8-sig").splitlines()
-    csv_lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
-    return list(csv.DictReader(csv_lines))
+    def __init__(self) -> None:
+        super().__init__()
+        self.chars = 0
+        self._hidden = 0
 
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        self._hidden += tag in {"script", "style", "noscript"}
 
-def resolve_file(record: dict, manifest: Path) -> Path:
-    """Resolve a manifest path, with a fallback to the raw folder."""
-    recorded = record.get("path")
-    if recorded:
-        path = Path(recorded)
-        if path.is_file():
-            return path
+    def handle_endtag(self, tag: str) -> None:
+        self._hidden -= tag in {"script", "style", "noscript"} and self._hidden > 0
 
-        fallback = manifest.parent / path.name
-        if fallback.is_file():
-            return fallback
-
-    raise FileNotFoundError(f"Downloaded file not found: {record.get('path', '(no path)')}")
+    def handle_data(self, data: str) -> None:
+        if not self._hidden:
+            self.chars += len(" ".join(data.split()))
 
 
-def measure_corpus(records: list[dict], manifest: Path) -> dict:
-    """Measure downloaded files and parse them using HardenHelp."""
-    downloaded = [record for record in records if record.get("status") == "downloaded"]
+def measure(path: Path) -> dict:
+    """Pages and characters of one file. PDFs are sampled; text and HTML are read fully."""
+    ext = path.suffix.lower()
+    try:
+        if ext == ".pdf":
+            reader = PdfReader(path)
+            pages = len(reader.pages)
+            step = max(1, pages // PDF_SAMPLE)
+            sample = list(range(0, pages, step))[:PDF_SAMPLE]
+            seen = sum(len(reader.pages[i].extract_text() or "") for i in sample)
+            chars = round(seen / max(1, len(sample)) * pages)
+            note = "almost no text: scanned?" if pages and chars / pages < 100 else ""
+            return {"kind": "pdf", "pages": pages, "chars": chars, "note": note}
+        if ext in {".html", ".htm"}:
+            parser = VisibleText()
+            parser.feed(path.read_text(encoding="utf-8", errors="replace"))
+            return {"kind": "html", "pages": parser.chars / CHARS_PER_PAGE, "chars": parser.chars}
+        if ext in TEXT_EXT:
+            chars = len(path.read_text(encoding="utf-8", errors="replace"))
+            return {"kind": "text", "pages": chars / CHARS_PER_PAGE, "chars": chars}
+    except Exception as exc:  # a broken file must not stop the report
+        return {"kind": "unreadable", "pages": 0, "chars": 0, "note": type(exc).__name__}
+    return {"kind": "other", "pages": 0, "chars": 0, "note": "not measured"}
 
-    result = {
-        "downloaded": len(downloaded),
-        "parsed": 0,
-        "failed": 0,
-        "missing": 0,
-        "pages": 0,
-        "heading_entries": 0,
-        "tables": 0,
-        "characters": 0,
-        "text_bytes": 0,
-        "raw_bytes": 0,
-        "files": [],
-        "errors": [],
-    }
 
-    for record in downloaded:
+def load_records() -> list[dict]:
+    latest: dict[str, dict] = {}
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
         try:
-            path = resolve_file(record, manifest)
-            result["raw_bytes"] += path.stat().st_size
-            parsed = parse_file(path)
-
-            page_count = len(parsed.pages)
-            heading_entries = sum(len(page.headings) for page in parsed.pages)
-            table_count = sum(page.tables for page in parsed.pages)
-            characters = sum(len(page.text) for page in parsed.pages)
-            text_bytes = sum(len(page.text.encode("utf-8")) for page in parsed.pages)
-
-            result["parsed"] += 1
-            result["pages"] += page_count
-            result["heading_entries"] += heading_entries
-            result["tables"] += table_count
-            result["characters"] += characters
-            result["text_bytes"] += text_bytes
-            result["files"].append(
-                {
-                    "title": record.get("title") or path.name,
-                    "name": path.name,
-                    "source": record.get("source") or "Unknown",
-                    "pages": page_count,
-                    "characters": characters,
-                    "bytes": path.stat().st_size,
-                    "parser": parsed.parser,
-                    "kind": parsed.kind,
-                }
-            )
-
-        except FileNotFoundError as exc:
-            result["missing"] += 1
-            result["errors"].append(str(exc))
-        except (ParseError, OSError) as exc:
-            result["failed"] += 1
-            result["errors"].append(f"{record.get('title', 'Unknown')}: {exc}")
-
-    return result
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        latest[record["url"]] = record
+    return list(latest.values())
 
 
-def format_bytes(value: int) -> str:
-    return f"{value / (1024 * 1024):.4f} MiB"
+def measure_all(records: list[dict]) -> None:
+    cache = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
+    for number, record in enumerate(records, start=1):
+        if record["sha256"] not in cache:
+            cache[record["sha256"]] = measure(Path(record["path"]))
+            if number % 100 == 0:
+                print(f"measured {number} of {len(records)} files")
+        record.update(cache[record["sha256"]])
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(cache), encoding="utf-8")
 
 
-def percentage(numerator: int, denominator: int) -> str:
-    if denominator == 0:
-        return "N/A"
-    return f"{numerator / denominator * 100:.2f}%"
+def put_block(path: Path, title: str, block: str) -> None:
+    """Replace the generated block, keep everything else. Creates the file if needed."""
+    text = path.read_text(encoding="utf-8") if path.exists() else f"# {title}\n"
+    wrapped = f"{START}\n{block.strip()}\n{END}"
+    if START in text and END in text:
+        text = text[: text.index(START)] + wrapped + text[text.index(END) + len(END) :]
+    else:
+        text = text.rstrip() + "\n\n" + wrapped + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
-def build_dataset_report(
-    sources: list[dict], records: list[dict], metrics: dict, generated: str
-) -> str:
-    source_counts = Counter(row.get("source") or "Unknown" for row in sources)
-    status_counts = Counter(record.get("status", "unknown") for record in records)
+def cell(value: object) -> str:
+    return str(value or "").replace("|", "/").replace("\n", " ").strip()
 
-    lines = [
-        "# HardenHelp Dataset Documentation",
-        "",
-        "## 1. Dataset Overview",
-        "",
-        "HardenHelp uses security configuration information related to Ubuntu 22.04 LTS "
-        "and its security hardening requirements.",
-        "",
-        "The target is Ubuntu 22.04 LTS STIG requirements and matching ComplianceAsCode rules.",
-        "",
-        "## 2. Source Inventory",
-        "",
-        f"The source inventory contains **{len(sources)} records** in `data/sources.csv`.",
-        "",
-        "| Source | Inventory records |",
-        "|---|---:|",
-    ]
 
-    for source, count in sorted(source_counts.items()):
-        lines.append(f"| {source} | {count} |")
-
-    lines.extend(
-        [
-            f"| **Total** | **{len(sources)}** |",
-            "",
-            "The inventory lists candidate resources. It does not mean every resource "
-            "has been downloaded or approved for redistribution.",
-            "",
-            "## 3. Actual Collection Status",
-            "",
-            f"Report generated: {generated}",
-            "",
-            f"- Manifest records: {len(records)}",
-            f"- Successfully downloaded files: {metrics['downloaded']}",
-            f"- Files parsed successfully by the local parser: {metrics['parsed']}",
-            f"- Local parsing failures: {metrics['failed']}",
-            f"- Missing downloaded files: {metrics['missing']}",
-            "",
-            "Manifest status counts:",
-            "",
-            "| Status | Records |",
-            "|---|---:|",
-        ]
-    )
-
-    for status, count in sorted(status_counts.items()):
-        lines.append(f"| {status} | {count} |")
-
-    lines.extend(
-        [
-            "",
-            "## 4. Local Parser Measurements",
-            "",
-            "| Metric | Measured value |",
-            "|---|---:|",
-            f"| Downloaded source files | {metrics['downloaded']} |",
-            f"| Successfully parsed files | {metrics['parsed']} |",
-            f"| Local parsing failures | {metrics['failed']} |",
-            f"| Parser-generated pages | {metrics['pages']} |",
-            f"| Heading path entries across pages | {metrics['heading_entries']} |",
-            f"| Extracted Markdown tables | {metrics['tables']} |",
-            f"| Extracted characters | {metrics['characters']:,} |",
-            f"| Raw source size | {metrics['raw_bytes']:,} bytes |",
-            f"| Raw source size | {format_bytes(metrics['raw_bytes'])} |",
-            f"| Extracted UTF-8 text size | {metrics['text_bytes']:,} bytes |",
-            f"| Estimated tokens (characters / 4) | {metrics['characters'] // 4:,} |",
-            "",
-            "These are local parser measurements. They do not prove that pages are stored "
-            "in PostgreSQL. Use `scripts/parsing_coverage.py` for database storage coverage.",
-            "",
-            "The token count is a rough estimate, not a model tokenizer measurement. "
-            "Heading path entries count the heading paths attached to pages, so the same "
-            "heading can be counted on multiple pages.",
-            "",
-            "## 5. Downloaded File Details",
-            "",
-            "| File | Source | Parser | Pages | Characters | Raw bytes |",
-            "|---|---|---|---:|---:|---:|",
-        ]
-    )
-
-    for item in metrics["files"]:
-        lines.append(
-            f"| {item['name']} | {item['source']} | {item['parser']} | "
-            f"{item['pages']} | {item['characters']:,} | {item['bytes']:,} |"
+def dataset_block(done: list[dict], not_done: list[dict], today: str) -> str:
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for record in done:
+        groups[record["source"]].append(record)
+    rows = []
+    for name, items in sorted(groups.items()):
+        how = sorted({r.get("via", "http") for r in items})
+        commit = next((r["commit"][:10] for r in items if r.get("commit")), "")
+        size = sum(r["bytes"] for r in items) / 1e6
+        pages = round(sum(r["pages"] for r in items))
+        fetched = max(r["fetched_at"] for r in items)[:10]
+        rows.append(
+            f"| {cell(name)} | {cell(items[0]['licence'])} | {len(items)} | {size:.1f} | {pages:,} "
+            f"| {'+'.join(how)}{' @ ' + commit if commit else ''} | {fetched} | {items[0]['url']} |"
         )
-
-    lines.extend(
-        [
-            "",
-            "## 6. Licensing and Usage Restrictions",
-            "",
-            "- ComplianceAsCode entries are labelled BSD-3-Clause in the inventory. "
-            "Retain applicable notices and check the repository licence.",
-            "- DISA and NIST entries require checking the applicable source and document notices.",
-            "- Ubuntu and OpenSCAP reference entries remain reference-only until their "
-            "specific redistribution permissions are confirmed.",
-            "- Public accessibility does not automatically grant permission "
-            "to redistribute content.",
-            "- The inventory licence field is recorded metadata, not a legal determination.",
-            "",
-            "## 7. Data Collection Safeguards",
-            "",
-            "The downloader is designed to use source approval checks, robots.txt checks, "
-            "a descriptive User-Agent, request delays, limited concurrency, retries, "
-            "resumable downloads, response validation and a download manifest.",
-            "",
-            "## 8. Known Gaps",
-            "",
-            "- The source inventory is larger than the currently downloaded corpus.",
-            "- Not every source has verified redistribution permission.",
-            "- The local parser measurements do not establish PostgreSQL storage coverage.",
-            "- Token counts are estimates and should be replaced with tokenizer measurements "
-            "when an embedding model is selected.",
-            "- The full target corpus has not yet been collected.",
-            "- OCR and scanned-document coverage require separate verification.",
-            "",
-            "## 9. References",
-            "",
-            "- DISA STIG: https://www.stigviewer.com/",
-            "- NIST NCP: https://ncp.nist.gov/",
-            "- ComplianceAsCode: https://github.com/ComplianceAsCode/content",
-            "- Ubuntu: https://ubuntu.com/",
-            "- OpenSCAP: https://www.open-scap.org/",
-            "",
-            "---",
-            "",
-            "**Project:** HardenHelp",
-            "",
-            "**Target platform:** Ubuntu 22.04 LTS",
-            "",
-            "**Inventory:** `data/sources.csv`",
-            "",
-        ]
-    )
-
-    return "\n".join(lines)
-
-
-def build_capacity_report(metrics: dict, full_files: int, generated: str) -> str:
-    downloaded = metrics["downloaded"]
-    estimated_tokens = metrics["characters"] // 4
-    average_tokens = estimated_tokens / downloaded if downloaded else 0
-    projected_tokens = round(average_tokens * full_files)
-    chunks_at_500 = (projected_tokens + 499) // 500 if projected_tokens else 0
-    ten_x_tokens = estimated_tokens * 10
-    ten_x_chunks = (ten_x_tokens + 499) // 500 if ten_x_tokens else 0
-
+    blocked = sum(r["status"] == "blocked" for r in not_done)
+    failed = sum(r["status"] == "failed" for r in not_done)
+    listed = sorted(done, key=lambda r: (r["source"], r["path"]))[:200]
+    files = [
+        f"| {i} | {cell(r.get('title') or Path(r['path']).name)} | {cell(r['source'])} "
+        f"| {round(r['pages']) or ''} | {r['fetched_at'][:10]} | {r['url']} |"
+        for i, r in enumerate(listed, start=1)
+    ]
+    total_mb = sum(r["bytes"] for r in done) / 1e6
+    total_pages = round(sum(r["pages"] for r in done))
     return "\n".join(
         [
-            "# Capacity and Scalability",
+            f"## Sources (generated {today} UTC by scripts/dataset_report.py)",
             "",
-            "## 1. Purpose",
+            "| Source | Licence / terms | Files | MB | Pages* | How | Fetched | Example URL |",
+            "|---|---|---|---|---|---|---|---|",
+            *rows,
             "",
-            "This report estimates corpus capacity using the current downloaded files. "
-            "It distinguishes measured local data from projections.",
+            f"**Total:** {len(done):,} files, {total_mb:.1f} MB, {total_pages:,} pages. "
+            f"Not downloaded: {blocked} blocked by robots.txt, {failed} failed.",
             "",
-            f"Report generated: {generated}",
+            "*Pages = PDF pages, plus one page per 3,000 characters of text or HTML.",
             "",
-            "## 2. Measured Current Corpus",
+            f"## Files (first {len(listed)} of {len(done):,})",
             "",
-            "| Metric | Measured value |",
-            "|---|---:|",
-            f"| Downloaded source files | {downloaded} |",
-            f"| Successfully parsed files | {metrics['parsed']} |",
-            f"| Parser-generated pages | {metrics['pages']} |",
-            f"| Heading path entries | {metrics['heading_entries']} |",
-            f"| Extracted tables | {metrics['tables']} |",
-            f"| Extracted characters | {metrics['characters']:,} |",
-            f"| Raw source size | {metrics['raw_bytes']:,} bytes |",
-            f"| Extracted UTF-8 text size | {metrics['text_bytes']:,} bytes |",
-            f"| Estimated tokens | {estimated_tokens:,} |",
+            "The complete list, with a sha256 fingerprint of every file, is `data/manifest.jsonl`.",
             "",
-            "Token estimate = extracted characters / 4. This is a planning estimate, "
-            "not an exact tokenizer result.",
-            "",
-            "## 3. Full Target Projection",
-            "",
-            f"The requested planning target is **{full_files:,} files/rules**. "
-            "This is a projection, not a claim that the target has been collected.",
-            "",
-            f"- Average estimated tokens per downloaded file: {average_tokens:,.1f}",
-            f"- Projected tokens at the full target: {projected_tokens:,}",
-            f"- Approximate 500-token chunks at the full target: {chunks_at_500:,}",
-            "",
-            "The projection assumes the average size of the current corpus remains "
-            "representative. The actual full corpus may be substantially different.",
-            "",
-            "## 4. Embedding Cost",
-            "",
-            "No embedding provider or model is configured, so an actual embedding cost "
-            "cannot currently be calculated.",
-            "",
-            f"- Current estimated input: {estimated_tokens:,} tokens.",
-            f"- Full-target estimated input: {projected_tokens:,} tokens.",
-            "- Cost formula: (input tokens / 1,000,000) × provider price per million tokens.",
-            "- Convert the provider's price to INR using the applicable exchange rate "
-            "when estimating rupee cost.",
-            "",
-            "**Question: Is embedding cost a problem?** It cannot be determined until "
-            "a provider and model price are selected. The full-target token estimate "
-            "above is the input needed for that calculation.",
-            "",
-            "## 5. PostgreSQL Storage",
-            "",
-            f"The extracted text alone occupies {metrics['text_bytes']:,} UTF-8 bytes "
-            "locally. This is not a measurement of PostgreSQL storage.",
-            "",
-            "Database storage also includes row, index, JSONB, and database overhead. "
-            "Vector storage cannot be estimated reliably until the embedding dimensions "
-            "and storage format are selected.",
-            "",
-            "**Question: Do vectors and text fit in free PostgreSQL?** Check the actual "
-            "database provider dashboard for its current storage limit and current usage. "
-            "Compare those values with a database-side measurement after loading the "
-            "full corpus. Do not treat local text bytes as total database size.",
-            "",
-            "## 6. Least Certain Estimate",
-            "",
-            "The least certain number is the full-target token projection because it "
-            "assumes the current files represent all future rules and documents.",
-            "",
-            "A better measurement is to collect a representative sample across all "
-            "target operating systems and file types, count tokens using the selected "
-            "embedding model's tokenizer, and then project by source category.",
-            "",
-            "## 7. What Changes at 10x Corpus Size?",
-            "",
-            f"- At 10x the current corpus, the rough estimate is {ten_x_tokens:,} tokens "
-            f"and {ten_x_chunks:,} chunks of 500 tokens each.",
-            "- Re-measure database storage, indexing, ingestion time, query latency, "
-            "and embedding cost; do not assume they scale linearly.",
-            "",
-            "## 8. Current Limitations",
-            "",
-            "- No embedding provider or model is configured.",
-            "- Token count is estimated rather than measured with a model tokenizer.",
-            "- PostgreSQL storage usage and provider quota have not been measured here.",
-            "- Vector dimensions and vector storage overhead are not yet known.",
-            "- The full target corpus has not been collected.",
-            "- Production load and query performance have not been benchmarked.",
-            "",
+            "| # | Title / file | Source | Pages | Fetched | URL |",
+            "|---|---|---|---|---|---|",
+            *files,
         ]
     )
 
 
-def main() -> None:
+def capacity_block(done: list[dict], args: argparse.Namespace, today: str) -> str:
+    files, size_mb = len(done), sum(r["bytes"] for r in done) / 1e6
+    pages = sum(r["pages"] for r in done)
+    chars = sum(r["chars"] for r in done)
+    tokens = chars / CHARS_PER_TOKEN
+    scanned = sum(1 for r in done if "scanned" in r.get("note", ""))
+    skipped = sum(1 for r in done if r["kind"] in {"other", "unreadable"})
+    if args.full_pages:
+        scale, target = args.full_pages / pages, f"{args.full_pages:,} pages"
+    else:
+        scale, target = args.full_files / files, f"{args.full_files:,} files"
+    full_tokens = tokens * scale
+    chunks = full_tokens / args.chunk_tokens * OVERLAP
+    embed_usd = full_tokens * OVERLAP / 1e6 * args.embed_usd
+    vector_mb = chunks * args.dims * 4 / 1e6
+    text_mb = chars * scale * 1.2 / 1e6
+    return "\n".join(
+        [
+            f"## Measured on my start corpus ({today} UTC)",
+            "",
+            "| What | Value |",
+            "|---|---|",
+            f"| Files | {files:,} |",
+            f"| Size on disk | {size_mb:.1f} MB |",
+            f"| Pages (PDF pages + 1 per 3,000 characters of text/HTML) | {pages:,.0f} |",
+            f"| Characters of text | {chars:,} |",
+            f"| Estimated tokens (characters / {CHARS_PER_TOKEN}) | {tokens:,.0f} |",
+            f"| Tokens per page | {tokens / pages:,.0f} |",
+            f"| PDFs with almost no text (scanned? OCR is Day 7) | {scanned} |",
+            f"| Files not measured (zip, xlsx, unreadable) | {skipped} |",
+            "",
+            f"## Estimate for the full corpus (target: {target})",
+            "",
+            "| What | How | Value |",
+            "|---|---|---|",
+            f"| Scale factor | target / measured | x {scale:.1f} |",
+            f"| Tokens | measured tokens x scale | {full_tokens / 1e6:.2f} M |",
+            f"| Raw files | measured MB x scale | {size_mb * scale:,.0f} MB |",
+            f"| Chunks | tokens / {args.chunk_tokens} x {OVERLAP} overlap | {chunks:,.0f} |",
+            f"| Embedding cost, one time | tokens x {OVERLAP} x ${args.embed_usd} per 1M "
+            f"| ${embed_usd:,.2f} = Rs {embed_usd * args.usd_inr:,.0f} |",
+            f"| Vector storage | chunks x {args.dims} numbers x 4 bytes | {vector_mb:,.0f} MB |",
+            f"| Text in Postgres | characters x scale x 1.2 | {text_mb:,.0f} MB |",
+            "",
+            f"Assumptions: {CHARS_PER_TOKEN} characters per token, "
+            f"{args.chunk_tokens}-token chunks, {args.dims}-dimension embeddings "
+            f"at ${args.embed_usd} per 1M tokens, Rs {args.usd_inr:g} per US dollar.",
+        ]
+    )
+
+
+def main() -> int:
+    sys.stdout.reconfigure(errors="replace")  # odd characters never crash a Windows console
     parser = argparse.ArgumentParser(
-        description="Generate DATASET.md and docs/CAPACITY.md from the corpus."
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument(
-        "--manifest",
-        type=Path,
-        default=DEFAULT_MANIFEST,
-        help="Path to the JSONL download manifest.",
-    )
-    parser.add_argument(
-        "--full-files",
-        type=int,
-        default=4000,
-        help="Full target corpus size used for capacity projections.",
-    )
+    goal = parser.add_mutually_exclusive_group(required=True)
+    goal.add_argument("--full-pages", type=int, help="pages in your FULL corpus target")
+    goal.add_argument("--full-files", type=int, help="files in your FULL corpus target")
+    parser.add_argument("--embed-usd", type=float, default=0.15, help="embedding $ per 1M tokens")
+    parser.add_argument("--usd-inr", type=float, default=95.0, help="rupees per US dollar")
+    parser.add_argument("--dims", type=int, default=768, help="numbers per embedding vector")
+    parser.add_argument("--chunk-tokens", type=int, default=400)
     args = parser.parse_args()
-
-    if args.full_files < 1:
-        parser.error("--full-files must be at least 1")
-
-    manifest = args.manifest
-    if not manifest.is_absolute():
-        manifest = ROOT / manifest
-
-    records = load_manifest(manifest)
-    sources = load_sources()
-    metrics = measure_corpus(records, manifest)
-    generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-
-    (ROOT / "DATASET.md").write_text(
-        build_dataset_report(sources, records, metrics, generated),
-        encoding="utf-8",
-    )
-
-    capacity_path = ROOT / "docs" / "CAPACITY.md"
-    capacity_path.parent.mkdir(parents=True, exist_ok=True)
-    capacity_path.write_text(
-        build_capacity_report(metrics, args.full_files, generated),
-        encoding="utf-8",
-    )
-
-    print("Dataset reports generated.")
-    print(f"Manifest: {manifest}")
-    print(f"Inventory records: {len(sources)}")
-    print(f"Downloaded files: {metrics['downloaded']}")
-    print(f"Locally parsed files: {metrics['parsed']}")
-    print(f"Local parsing failures: {metrics['failed']}")
-    print(f"Missing files: {metrics['missing']}")
-    print(f"Parser-generated pages: {metrics['pages']}")
-    print(f"Estimated tokens: {metrics['characters'] // 4:,}")
-    print("Updated: DATASET.md")
-    print("Updated: docs/CAPACITY.md")
-
-    if metrics["errors"]:
-        print("\nFiles needing attention:")
-        for error in metrics["errors"]:
-            print(f"- {error}")
+    if not MANIFEST.exists():
+        print("data/manifest.jsonl not found: run scripts/fetch.py first")
+        return 1
+    records = load_records()
+    done = [r for r in records if r["status"] == "downloaded" and Path(r["path"]).is_file()]
+    not_done = [r for r in records if r["status"] != "downloaded"]
+    measure_all(done)
+    if not sum(r["pages"] for r in done):
+        print("nothing measurable yet: download some PDF, HTML or text files first")
+        return 1
+    today = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+    put_block(Path("DATASET.md"), "Dataset", dataset_block(done, not_done, today))
+    put_block(Path("docs/CAPACITY.md"), "Capacity plan", capacity_block(done, args, today))
+    pages = sum(r["pages"] for r in done)
+    print(f"files={len(done)} pages={pages:,.0f} -> wrote DATASET.md and docs/CAPACITY.md")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,41 +1,59 @@
-"""Persist parsed documents and parsing failures in PostgreSQL."""
+"""Save parsed documents and record parsing failures."""
 
 import hashlib
 from pathlib import Path
-from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hardenhelp.db.models import Document, Page, ParseFailure
-from hardenhelp.ingest.parse import ParsedDoc
+from hardenhelp.ingest.parse import ParsedDoc, ParseError
 
 
-def file_sha256(path: Path) -> str:
-    """Return the SHA-256 fingerprint of a file."""
+def document_id(sha256: str) -> str:
+    """Files are identified by their content."""
+    return f"f-{sha256[:20]}"
+
+
+def file_hash(path: Path) -> str:
+    """Calculate the SHA-256 hash of a file."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+async def parsed_ids(session: AsyncSession) -> set[str]:
+    rows = await session.scalars(select(Document.external_id).where(Document.doc_type != "record"))
+    return set(rows)
+
+
+async def failed_paths(session: AsyncSession) -> set[str]:
+    return set(await session.scalars(select(ParseFailure.path)))
 
 
 async def save_parsed(
     session: AsyncSession,
     *,
     path: Path,
-    record: dict[str, Any],
+    record: dict,
     parsed: ParsedDoc,
 ) -> Document:
-    """Save a parsed document and replace its pages idempotently."""
-    sha256 = file_sha256(path)
-    external_id = sha256
+    """Save a parsed document and its pages without creating duplicates."""
+    own_transaction = not session.in_transaction()
+
+    file_path = str(path)
+    sha256 = file_hash(path)
+    external_id = document_id(sha256)
+
+    title = parsed.title or record.get("title") or path.stem
 
     metadata = {
-        "path": str(path),
+        "source": record.get("source", ""),
+        "path": file_path,
         "parser": parsed.parser,
         "pages": len(parsed.pages),
         "tables": sum(page.tables for page in parsed.pages),
+        "chars": sum(len(page.text) for page in parsed.pages),
         "scanned_pages": parsed.scanned_pages,
-        "source": record.get("source"),
-        "download_url": record.get("download_url"),
     }
 
     document = await session.scalar(select(Document).where(Document.external_id == external_id))
@@ -43,9 +61,9 @@ async def save_parsed(
     if document is None:
         document = Document(
             external_id=external_id,
-            title=parsed.title or record.get("title") or path.name,
+            title=title[:500],
             source_url=record.get("url"),
-            licence=record.get("licence"),
+            licence=(record.get("licence") or "")[:200],
             doc_type=parsed.kind,
             sha256=sha256,
             metadata_=metadata,
@@ -53,64 +71,98 @@ async def save_parsed(
         session.add(document)
         await session.flush()
     else:
-        document.title = parsed.title or record.get("title") or path.name
+        document.title = title[:500]
         document.source_url = record.get("url")
-        document.licence = record.get("licence")
+        document.licence = (record.get("licence") or "")[:200]
         document.doc_type = parsed.kind
         document.sha256 = sha256
         document.metadata_ = metadata
 
         await session.execute(delete(Page).where(Page.document_id == document.id))
+        await session.flush()
 
-    session.add_all(
-        [
+    for page in parsed.pages:
+        session.add(
             Page(
                 document_id=document.id,
                 page_no=page.page_no,
                 text=page.text,
                 headings=page.headings,
             )
-            for page in parsed.pages
-        ]
-    )
+        )
 
-    await session.execute(delete(ParseFailure).where(ParseFailure.path == str(path)))
-    await session.flush()
+    await session.execute(delete(ParseFailure).where(ParseFailure.path == file_path))
 
+    if own_transaction:
+        await session.commit()
+    else:
+        await session.flush()
+
+    await session.refresh(document)
     return document
+
+
+async def save_document(
+    session: AsyncSession,
+    record: dict,
+    parsed: ParsedDoc,
+) -> Document:
+    """Backward-compatible wrapper for the corpus workflow."""
+    return await save_parsed(
+        session,
+        path=Path(record["path"]),
+        record=record,
+        parsed=parsed,
+    )
 
 
 async def save_failure(
     session: AsyncSession,
+    record: dict,
+    error: ParseError | None = None,
     *,
-    path: Path,
-    record: dict[str, Any],
-    reason: str,
+    path: Path | None = None,
+    reason: str | None = None,
     detail: str = "",
 ) -> None:
-    """Insert a parse failure or update its details and attempt count."""
-    sha256 = file_sha256(path) if path.is_file() else hashlib.sha256(b"").hexdigest()
+    """Insert a parse failure or increment its retry count."""
+    own_transaction = not session.in_transaction()
 
-    statement = insert(ParseFailure).values(
-        path=str(path),
-        sha256=sha256,
-        source_url=record.get("url"),
-        reason=reason[:40],
-        detail=detail[:500],
-        attempts=1,
-    )
+    if path is None:
+        path = Path(record["path"])
 
+    if error is not None:
+        reason = error.reason
+        detail = error.detail
+
+    if reason is None:
+        raise ValueError("A parse failure reason is required.")
+
+    sha256 = record["sha256"] if record.get("sha256") else file_hash(path)
+
+    row = {
+        "path": str(path),
+        "sha256": sha256,
+        "source_url": record.get("url"),
+        "reason": reason,
+        "detail": detail,
+    }
+
+    statement = insert(ParseFailure).values(**row)
     statement = statement.on_conflict_do_update(
         index_elements=[ParseFailure.path],
         set_={
-            "sha256": statement.excluded.sha256,
-            "source_url": statement.excluded.source_url,
-            "reason": statement.excluded.reason,
-            "detail": statement.excluded.detail,
+            "sha256": sha256,
+            "source_url": row["source_url"],
+            "reason": reason,
+            "detail": detail,
             "attempts": ParseFailure.attempts + 1,
-            "updated_at": func.now(),
         },
     )
 
     await session.execute(statement)
-    await session.flush()
+
+    if own_transaction:
+        await session.commit()
+    else:
+        await session.flush()

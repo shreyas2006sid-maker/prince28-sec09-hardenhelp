@@ -1,41 +1,26 @@
 """Tests for robots.txt handling in the HardenHelp downloader."""
 
-from pathlib import Path
-
 import httpx
 import pytest
 
-from hardenhelp.ingest.fetch import Downloader
+from hardenhelp.ingest.fetch import Robots
 
 
 @pytest.mark.asyncio
-async def test_robots_allows_when_file_returns_404(tmp_path: Path) -> None:
-    """A missing robots.txt means there are no published crawler rules."""
-
+async def test_robots_allows_when_file_returns_404() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/robots.txt"
         return httpx.Response(404)
 
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
+        allowed, _ = await robots.check("https://example.com/file.yml")
 
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-        assert await downloader._robots_allowed("https://example.com/file.yml") is True
-
-        await downloader.client.aclose()
-        downloader.client = None
+    assert allowed is True
 
 
 @pytest.mark.asyncio
-async def test_robots_blocks_disallowed_path(tmp_path: Path) -> None:
-    """Protego must block paths disallowed for our User-Agent."""
-
+async def test_robots_blocks_disallowed_path() -> None:
     robots_content = """
 User-agent: *
 Disallow: /private/
@@ -45,28 +30,18 @@ Allow: /private/public.yml
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=robots_content)
 
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
 
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        blocked, _ = await robots.check("https://example.com/private/secret.yml")
+        allowed, _ = await robots.check("https://example.com/public/file.yml")
 
-        assert await downloader._robots_allowed("https://example.com/private/secret.yml") is False
-
-        assert await downloader._robots_allowed("https://example.com/public/file.yml") is True
-
-        assert await downloader.client.aclose() is None
-        downloader.client = None
+    assert blocked is False
+    assert allowed is True
 
 
 @pytest.mark.asyncio
-async def test_robots_allows_explicitly_allowed_path(tmp_path: Path) -> None:
-    """An explicitly allowed path can be crawled."""
-
+async def test_robots_allows_explicitly_allowed_path() -> None:
     robots_content = """
 User-agent: *
 Disallow: /
@@ -76,69 +51,55 @@ Allow: /approved/
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text=robots_content)
 
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
 
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        allowed, _ = await robots.check("https://example.com/approved/file.yml")
+        blocked, _ = await robots.check("https://example.com/blocked/file.yml")
 
-        assert await downloader._robots_allowed("https://example.com/approved/file.yml") is True
-
-        assert await downloader._robots_allowed("https://example.com/blocked/file.yml") is False
-
-        await downloader.client.aclose()
-        downloader.client = None
+    assert allowed is True
+    assert blocked is False
 
 
-@pytest.mark.parametrize("status_code", [403, 429, 500, 503])
+@pytest.mark.parametrize("status_code", [429, 500, 503])
 @pytest.mark.asyncio
-async def test_robots_fails_closed_for_unexpected_status(
-    tmp_path: Path,
+async def test_robots_fails_closed_for_server_errors(
     status_code: int,
 ) -> None:
-    """Unexpected robots.txt responses must block downloading."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
+        allowed, _ = await robots.check("https://example.com/file.yml")
+
+    assert allowed is False
+
+
+@pytest.mark.parametrize("status_code", [403, 404])
+@pytest.mark.asyncio
+async def test_robots_allows_when_file_is_unavailable(
+    status_code: int,
+) -> None:
+    """RFC 9309 treats 4xx robots.txt responses as unavailable."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status_code)
 
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
+        allowed, _ = await robots.check("https://example.com/file.yml")
 
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-        assert await downloader._robots_allowed("https://example.com/file.yml") is False
-
-        await downloader.client.aclose()
-        downloader.client = None
+    assert allowed is True
 
 
 @pytest.mark.asyncio
-async def test_robots_fails_closed_on_network_error(tmp_path: Path) -> None:
-    """Network errors while checking robots.txt must block downloading."""
-
+async def test_robots_fails_closed_on_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("Simulated connection failure")
 
-    async with Downloader(
-        tmp_path / "raw",
-        tmp_path / "manifest.jsonl",
-        delay=0,
-    ) as downloader:
-        assert downloader.client is not None
-        await downloader.client.aclose()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        robots = Robots(client)
+        allowed, _ = await robots.check("https://example.com/file.yml")
 
-        downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-        assert await downloader._robots_allowed("https://example.com/file.yml") is False
-
-        await downloader.client.aclose()
-        downloader.client = None
+    assert allowed is False
