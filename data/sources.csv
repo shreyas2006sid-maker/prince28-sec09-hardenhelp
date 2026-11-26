@@ -1,5 +1,4 @@
-﻿
-url,source,licence,title
+﻿url,source,licence,title
 https://ncp.nist.gov/checklist/revision/6889,NIST,"NIST material is generally reusable unless specifically marked otherwise; attribute NIST; check linked document notices.",Ubuntu 22.04 STIG Current Checklist
 https://ncp.nist.gov/checklist/1235/download/19778,NIST,"NIST reference; verify redistribution terms of the downloaded DISA content.",Ubuntu 22.04 STIG Ver 2 Rel 10 XCCDF
 https://complianceascode.github.io/content-pages/rendered-policies/ubuntu2204/stig_ubuntu2204.html,ComplianceAsCode,"BSD-3-Clause; retain copyright notice, licence conditions and disclaimer.",Rendered Ubuntu 22.04 STIG
