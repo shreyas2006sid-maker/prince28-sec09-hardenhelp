@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 from protego import Protego
@@ -92,6 +92,31 @@ def pick_ext(url: str, content_type: str) -> str:
     if suffix in KNOWN_EXT:
         return suffix
     return EXT_BY_TYPE.get(content_type.split(";")[0].strip().lower(), ".bin")
+
+
+def github_raw_url(url: str) -> str:
+    """Convert a standard GitHub blob URL to its raw file URL."""
+    parts = urlsplit(url)
+
+    if parts.hostname not in {"github.com", "www.github.com"}:
+        return url
+
+    segments = parts.path.strip("/").split("/")
+
+    if len(segments) < 5 or segments[2] != "blob":
+        return url
+
+    raw_path = "/" + "/".join([segments[0], segments[1], *segments[3:]])
+
+    return urlunsplit(
+        (
+            "https",
+            "raw.githubusercontent.com",
+            raw_path,
+            "",
+            "",
+        )
+    )
 
 
 def backoff_delay(attempt: int, *, base: float = 1.0, cap: float = 60.0) -> float:
@@ -224,9 +249,11 @@ def make_client(max_concurrency: int = 4) -> httpx.AsyncClient:
     )
 
 
-async def _download(client: httpx.AsyncClient, src: Source, root: Path, raw_dir: Path) -> dict:
+async def _download(
+    client: httpx.AsyncClient, src: Source, request_url: str, root: Path, raw_dir: Path
+) -> dict:
     """One attempt. Streams to <name>.part, renames when complete, returns the manifest fields."""
-    async with client.stream("GET", src.url) as response:
+    async with client.stream("GET", request_url) as response:
         if response.status_code != 200:
             raise DownloadError(
                 f"HTTP {response.status_code}",
@@ -234,6 +261,11 @@ async def _download(client: httpx.AsyncClient, src: Source, root: Path, raw_dir:
                 retry_after=retry_after_seconds(response.headers.get("Retry-After")),
             )
         content_type = response.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        suffix = Path(urlsplit(src.url).path).suffix.lower()
+
+        if suffix in {".yml", ".yaml", ".json", ".xml"} and media_type == "text/html":
+            raise DownloadError(f"received HTML instead of {suffix} content")
         name = file_stem(src.url) + pick_ext(src.url, content_type)
         target = raw_dir / slug(src.source) / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -279,10 +311,11 @@ async def fetch_one(
         "title": src.title,
         "via": "http",
     }
-    allowed, crawl_delay = await robots.check(src.url)
+    request_url = github_raw_url(src.url)
+    allowed, crawl_delay = await robots.check(request_url)
     if not allowed:
         return record | {"status": "blocked", "error": "robots.txt", "fetched_at": now_iso()}
-    host = urlsplit(src.url).netloc
+    host = urlsplit(request_url).netloc
     error, code, attempt = "", None, 0
     for attempt in range(1, max_attempts + 1):
         wait = backoff_delay(attempt - 1)
@@ -290,7 +323,7 @@ async def fetch_one(
             await gate.wait(host, crawl_delay)
             try:
                 async with asyncio.timeout(ATTEMPT_TIMEOUT):
-                    fields = await _download(client, src, root, raw_dir)
+                    fields = await _download(client, src, request_url, root, raw_dir)
                 done = {"status": "downloaded", "attempts": attempt, "fetched_at": now_iso()}
                 return record | fields | done
             except DownloadError as exc:
