@@ -2,8 +2,6 @@
 
 import argparse
 import asyncio
-import json
-import re
 import time
 import uuid
 
@@ -14,17 +12,11 @@ from hardenhelp.config import get_settings
 from hardenhelp.db.llm_calls import make_recorder
 from hardenhelp.db.models import Document, Page
 from hardenhelp.db.session import make_engine, make_sessionmaker
-from hardenhelp.llm.doc_meta import DocMeta
-from hardenhelp.llm.gateway import LLMUnavailable, build_gateway
+from hardenhelp.llm.extract import extract_metadata
+from hardenhelp.llm.gateway import LLMUnavailable
 from hardenhelp.logging_setup import request_id_ctx
 
-PROMPT_VERSION = "extract_metadata_v1"
-REPAIR_PROMPT_VERSION = "extract_metadata_repair_v1"
 MAX_DOCUMENT_CHARS = 18000
-
-DOC_KIND_ALIASES = {
-    "guide": "guideline",
-}
 
 
 def load_prompt(path) -> str:
@@ -55,6 +47,8 @@ async def load_document_snapshot(session_factory, document_id, force):
 
         page_text = "\n\n".join(result.all())
 
+        import json
+
         metadata_text = json.dumps(
             metadata,
             ensure_ascii=False,
@@ -74,36 +68,6 @@ async def load_document_snapshot(session_factory, document_id, force):
             "sha256": document.sha256,
             "content": content[:MAX_DOCUMENT_CHARS],
         }
-
-
-def parse_json_response(raw: str) -> dict:
-    raw = raw.strip().lstrip("\ufeff")
-
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
-
-    payload = json.loads(raw)
-
-    if not isinstance(payload, dict):
-        raise ValueError("LLM response must be a JSON object.")
-
-    return payload
-
-
-def normalize_payload(payload: dict) -> tuple[dict, bool]:
-    """Normalize known aliases without weakening schema validation."""
-    repaired = False
-    kind = payload.get("doc_kind")
-
-    if isinstance(kind, str):
-        normalized = DOC_KIND_ALIASES.get(kind.strip().lower())
-
-        if normalized:
-            payload["doc_kind"] = normalized
-            repaired = True
-
-    return payload, repaired
 
 
 def record_usage(stats: dict, result) -> None:
@@ -127,7 +91,6 @@ async def extract_one(
     started_cost = stats["cost_inr"]
 
     try:
-        # Read from Neon, then close the session before any network request.
         snapshot = await load_document_snapshot(
             session_factory,
             document_id,
@@ -137,80 +100,17 @@ async def extract_one(
         if snapshot is None:
             return "skipped"
 
-        content = snapshot["content"]
-
-        messages = [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    f"Extract metadata from the following untrusted document content.\n\n{content}"
-                ),
-            },
-        ]
-
-        # No database session is held during this call.
-        result = await gateway.generate(
-            messages,
-            purpose="metadata_extraction",
-            prompt_version=PROMPT_VERSION,
-            temperature=0.0,
-            response_format={"type": "json_object"},
+        parsed, results, repaired = await extract_metadata(
+            gateway,
+            prompt,
+            snapshot["content"],
         )
 
-        record_usage(stats, result)
+        for result in results:
+            record_usage(stats, result)
 
-        repaired = False
+        final_result = results[-1]
 
-        try:
-            payload = parse_json_response(result.text)
-            payload, normalized = normalize_payload(payload)
-            parsed = DocMeta.model_validate(payload)
-            repaired = normalized
-
-        except (json.JSONDecodeError, ValidationError, ValueError) as first_error:
-            repair_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        prompt + "\n\nADDITIONAL INSTRUCTIONS:\n"
-                        "Correct the previous candidate so it satisfies every "
-                        "schema restriction. Return valid JSON only. Do not "
-                        "invent unsupported information. Preserve valid values."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "The previous candidate failed validation.\n\n"
-                        f"VALIDATION ERROR:\n{str(first_error)[:2500]}\n\n"
-                        "PREVIOUS CANDIDATE (UNTRUSTED DATA):\n"
-                        f"{result.text[:6000]}\n\n"
-                        "ORIGINAL DOCUMENT MATERIAL (UNTRUSTED DATA):\n"
-                        f"{content[:5000]}\n\n"
-                        "Return a corrected JSON object matching the schema."
-                    ),
-                },
-            ]
-
-            repair_result = await gateway.generate(
-                repair_messages,
-                purpose="metadata_extraction_repair",
-                prompt_version=REPAIR_PROMPT_VERSION,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-
-            record_usage(stats, repair_result)
-
-            repair_payload = parse_json_response(repair_result.text)
-            repair_payload, _ = normalize_payload(repair_payload)
-            parsed = DocMeta.model_validate(repair_payload)
-
-            result = repair_result
-            repaired = True
-
-        # Open a NEW database session to save the validated result.
         async with session_factory() as session, session.begin():
             document = await session.scalar(
                 select(Document).where(Document.id == document_id).with_for_update()
@@ -227,7 +127,6 @@ async def extract_one(
             if not force and "extracted" in current_metadata:
                 return "skipped"
 
-            # Do not attach metadata to a document changed during the LLM call.
             if document.sha256 != snapshot["sha256"]:
                 print(
                     f"SKIPPED STALE: {document_id} | {snapshot['title']}",
@@ -242,7 +141,7 @@ async def extract_one(
 
         print(
             f"{label}: {document_id} | {snapshot['title']} | "
-            f"{result.provider}/{result.model} | "
+            f"{final_result.provider}/{final_result.model} | "
             f"tokens_in={stats['tokens_in'] - started_in} "
             f"tokens_out={stats['tokens_out'] - started_out} "
             f"cost=Rs {stats['cost_inr'] - started_cost:.6f}",
@@ -252,11 +151,10 @@ async def extract_one(
         return "repaired" if repaired else "extracted"
 
     except LLMUnavailable as exc:
-        # No open document session needs to be rolled back here.
         print(f"LLM UNAVAILABLE: {document_id} | {exc}", flush=True)
         return "unavailable"
 
-    except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+    except (ValidationError, ValueError) as exc:
         print(f"INVALID: {document_id} | {exc}", flush=True)
         return "invalid"
 
@@ -297,13 +195,22 @@ async def main() -> None:
     settings = get_settings()
     prompt = load_prompt(settings.prompts_dir / "extract_metadata_v1.md")
 
+    # This extraction run must use Gemini only, never Groq fallback.
+    gemini_only_settings = settings.model_copy(update={"groq_api_key": ""})
+
     engine = make_engine(settings)
     session_factory = make_sessionmaker(engine)
-    gateway = build_gateway(settings, make_recorder(session_factory))
+
+    from hardenhelp.llm.gateway import build_gateway
+
+    gateway = build_gateway(
+        gemini_only_settings,
+        make_recorder(session_factory),
+    )
 
     if not gateway.providers:
         await engine.dispose()
-        raise RuntimeError("No LLM provider configured.")
+        raise RuntimeError("Gemini is not configured. Check GEMINI_API_KEY.")
 
     stats = {
         "extracted": 0,
@@ -321,7 +228,6 @@ async def main() -> None:
     documents = []
 
     try:
-        # Only collect document IDs. Do not keep ORM objects or connections open.
         async with session_factory() as session:
             statement = (
                 select(Document.id)
@@ -337,6 +243,7 @@ async def main() -> None:
 
             documents = list((await session.scalars(statement)).all())
 
+        print("Provider: Gemini only", flush=True)
         print(f"Documents selected: {len(documents)}", flush=True)
 
         for document_id in documents:
@@ -360,7 +267,7 @@ async def main() -> None:
             elif outcome == "unavailable":
                 stats["failed"] += 1
                 stopped = True
-                print("Stopping because LLM providers are unavailable.", flush=True)
+                print("Stopping because Gemini is unavailable.", flush=True)
                 break
             else:
                 stats["failed"] += 1
@@ -373,7 +280,6 @@ async def main() -> None:
 
     elapsed = time.perf_counter() - started
 
-    # Obtain final counts through fresh connections.
     count_engine = make_engine(settings)
 
     try:
@@ -412,7 +318,7 @@ async def main() -> None:
     print(f"Seconds:        {elapsed:.1f}")
 
     if stopped:
-        print("Status: Stopped due to LLM provider unavailability")
+        print("Status: Stopped due to Gemini unavailability")
     elif stats["invalid"] or stats["failed"]:
         print("Status: Completed with errors")
     else:
