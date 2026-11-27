@@ -481,7 +481,7 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 
 - My best router prompt: classify_v__ with ___ / 20
 - What I changed in v4, and what happened to the score:
-- The question my best version still gets wrong (line, wanted, got), and why I think so:
+- The question my best version still gets wrong (line, wanted, got), and why I think so
 - A label in my test set that I changed after seeing the results (or "none"):
 - Input tokens per question: v1 ___ , best version ___ . Is the extra accuracy worth it?
 
@@ -500,3 +500,47 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 - Cost at list price: Rs ___ in total, Rs ___ per document
 
 ### One thing that went wrong today, and how I fixed it
+### D09 · Prompts and structured output
+
+#### Prompt comparison
+
+- My best router prompt: classify_v1, classify_v2, classify_v3 and classify_v4 tied at 20 / 20 (100%) in the cached evaluation.
+- What I changed in v4, and what happened to the score: v4 was added and evaluated against the same 20-question test set. All four versions scored 20 / 20, so v4 did not demonstrate an accuracy improvement.
+- The question my best version still gets wrong: None in the cached evaluation; all 20 questions were classified correctly.
+- A label in my test set that I changed after seeing the results: none.
+- Input tokens per question: v1 not recorded; best version not recorded. The token comparison was not captured.
+- Evaluation details: 80 cached responses across four versions. The final comparison run made 0 new model calls. These results are cached evaluation results, not a fresh live-model comparison.
+
+| Prompt | Correct | Missed | Invalid | Accuracy |
+|---|---:|---:|---:|---:|
+| classify_v1 | 20 | 0 | 0 | 100% |
+| classify_v2 | 20 | 0 | 0 | 100% |
+| classify_v3 | 20 | 0 | 0 | 100% |
+| classify_v4 | 20 | 0 | 0 | 100% |
+
+#### My contract (DocMeta)
+
+- Fields kept from my project card: stig_id, rule_id, cci, ssg_rule, severity, os, check and fix.
+- Fields deleted: none of the project-card fields were deleted.
+- Common fields: doc_kind, year, language, summary and topics.
+- The field I tightened: doc_kind uses a Literal with an allowed set of document kinds. Year is also bounded between 1950 and 2027. Topics are converted to lowercase and duplicates are removed.
+- Each project-specific field is a list because one document can cover multiple rules or identifiers.
+
+#### Extraction run
+
+- Prompt version: extract_metadata_v1.md.
+- Documents successfully extracted today: 14 total (1 trial document and 13 in the subsequent run).
+- Repaired: 0 reported.
+- Invalid metadata records: 0 reported.
+- The subsequent run stopped after a Gemini ReadTimeout on document 144.
+- Not finished: 393 documents remain pending. The extraction script stopped when Gemini became unavailable; successful records were saved, so the run can resume.
+- Most common failure reason: Gemini ReadTimeout. The script stopped rather than continuing to send requests while the provider was unavailable.
+- A record that was valid but wrong: not yet established through manual comparison against five source documents.
+- Token usage: the 13-document run used 16,742 input tokens and 2,204 output tokens. The separate one-document trial used 1,202 input and 131 output tokens.
+- Reported extraction cost: Rs 0.000000 in the script output. This is the reported value, not an independently calculated list-price estimate.
+
+#### One thing that went wrong today, and how I fixed it
+
+The full metadata extraction stopped because Gemini returned a ReadTimeout. The script preserved the successful records and stopped safely. I can resume the pending documents by running the extraction command again when the provider is available.
+
+The corpus extraction is still incomplete: 393 documents remain pending. The 50-document minimum and the five-document manual verification requirement have not yet been met.
