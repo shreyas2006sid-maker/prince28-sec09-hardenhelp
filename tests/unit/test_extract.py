@@ -127,3 +127,58 @@ async def test_extract_metadata_normalizes_guide_without_repair():
     assert parsed.doc_kind == "guideline"
     assert len(results) == 1
     assert repaired is True
+
+
+# ADD THE NEW TEST HERE
+async def test_extract_metadata_repairs_empty_topics():
+    invalid = dict(VALID_METADATA)
+    invalid["topics"] = []
+
+    repaired_metadata = dict(VALID_METADATA)
+    repaired_metadata["topics"] = ["linux auditing"]
+
+    gateway = FakeGateway(
+        json.dumps(invalid),
+        json.dumps(repaired_metadata),
+    )
+
+    parsed, results, repaired = await extract_metadata(
+        gateway,
+        "Extract metadata.",
+        "Linux audit configuration document.",
+    )
+
+    assert parsed.topics == ["linux auditing"]
+    assert len(results) == 2
+    assert repaired is True
+    assert gateway.calls[1][1]["purpose"] == "metadata_extraction_repair"
+
+
+async def test_extract_repairs_empty_topics():
+    from hardenhelp.llm.extract import extract
+
+    invalid = dict(VALID_METADATA)
+    invalid["topics"] = []
+
+    repaired_metadata = dict(VALID_METADATA)
+    repaired_metadata["topics"] = ["linux auditing"]
+
+    gateway = FakeGateway(
+        json.dumps(invalid),
+        json.dumps(repaired_metadata),
+    )
+
+    result = await extract(
+        gateway,
+        DocMeta,
+        "Extract metadata.",
+        "extract_metadata_v1",
+        "Linux audit configuration",
+        "Configure audit log directory permissions.",
+    )
+
+    assert result.record is not None
+    assert result.record.topics == ["linux auditing"]
+    assert result.errors == []
+    assert len(gateway.calls) == 2
+    assert gateway.calls[1][1]["purpose"] == "document_extraction_repair"

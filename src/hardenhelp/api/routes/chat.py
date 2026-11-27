@@ -3,6 +3,7 @@
 import json
 from collections.abc import AsyncIterator
 from dataclasses import asdict
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -16,6 +17,7 @@ from hardenhelp.llm.gateway import LLMResult, LLMUnavailable
 router = APIRouter(tags=["chat"])
 
 PROMPT_VERSION = "chat_system_v1"
+CLASSIFIER_PROMPT_FILE = "classify_v4.md"
 
 PERSONAL_RESPONSE = (
     "HardenHelp cannot access your actual systems, current configuration, "
@@ -24,6 +26,21 @@ PERSONAL_RESPONSE = (
 )
 
 OFF_TOPIC_RESPONSE = "That question is outside HardenHelp's Linux and Windows hardening scope."
+
+
+def load_prompt(prompts_dir: Path, filename: str = "chat_system_v1.md") -> str:
+    """Load a prompt file from the configured prompts directory."""
+    prompt_path = Path(prompts_dir) / filename
+
+    if not prompt_path.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    if not prompt.strip():
+        raise ValueError(f"Prompt file is empty: {prompt_path}")
+
+    return prompt
 
 
 class ChatRequest(BaseModel):
