@@ -280,6 +280,28 @@ All smoke tests passed!
 
 ---
 
+## D06 · Source fetching
+
+### Downloader
+
+Implemented the source-fetching workflow in `scripts/fetch.py`, using the ingestion fetch module.
+
+The command-line options include:
+
+- `--csv`: source manifest path (defaults to `data/sources.csv`).
+- `--source`: optionally fetch only a selected source.
+- `--delay`: delay between requests to the same host (default: 1 second).
+- `--concurrency`: concurrent request limit (default: up to 4).
+- `--attempts`: retry limit (default: 4).
+
+The script reads the source manifest, calls the fetch workflow, and reports per-source results and a final summary. The downloader is designed to limit request concurrency and avoid sending requests to the same host without the configured delay.
+
+### Verification notes
+
+The downloaded files are recorded in the corpus manifest for the parsing stage. No fetch count, timing benchmark, or retry-failure measurement is recorded here; those values should only be added after capturing an actual run.
+
+---
+
 ## D07 · File parsing and page storage
 
 ### Corpus parsing
@@ -337,38 +359,47 @@ No failed files required retrying. The failure table contained no records.
 
 ### Parser comparison
 
-Compared two parsing approaches across all 10 successfully downloaded source files:
+Updated `scripts/compare_parsers.py` to compare suitable external parsers with the HardenHelp parser:
 
-1. **HardenHelp parser (`parse_text`)** — extracts page-based content, headings and text.
-2. **PyYAML (`yaml.safe_load`)** — loads compatible YAML files into structured Python objects.
+- PDF: PyMuPDF and pypdf.
+- HTML: Trafilatura and plain HTML tag stripping.
+- Markdown, reStructuredText, YAML, text and VAR files: HardenHelp parser output for inspection.
 
-| File | HardenHelp parser | PyYAML |
+The script selects up to 10 candidate files (largest first), supports explicitly supplied file paths, and appends its results to `NOTES.md` without replacing existing notes.
+
+**Corpus run**
+
+- 10 files were selected from the downloaded corpus.
+- The corpus contained 9 YAML files and 1 VAR file; it did not contain PDF or HTML files.
+- The HardenHelp parser successfully produced output for all 10 selected files.
+- Because the corpus had no PDF or HTML samples, the external PDF and HTML comparisons were checked separately with temporary test files.
+
+**PDF and HTML fixture checks**
+
+| Fixture | HardenHelp | External comparison |
 |---|---|---|
-| 32161c2f381f_stig_ubuntu2204.yml | Success: 189 pages, 43,097 chars | Success: dict |
-| 700e6db64957_rule.yml | Success: 1 page, 2,243 chars | Failed: line 50 |
-| f2742d7e57d5_sysctl_kernel_kptr_restrict_value.var | Success: 1 page, 206 chars | Success: dict |
-| d673964e617b_rule.yml | Success: 1 page, 2,722 chars | Success: dict |
-| 9ba340158085_rule.yml | Success: 2 pages, 3,790 chars | Failed: line 66 |
-| cc680acad6d2_rule.yml | Success: 4 pages, 9,958 chars | Success: dict |
-| 38e24efc4f21_rule.yml | Success: 1 page, 1,606 chars | Failed: line 36 |
-| 2d489e1253dc_rule.yml | Success: 1 page, 642 chars | Success: dict |
-| 6d9ce8481eb4_rule.yml | Success: 1 page, 1,710 chars | Success: dict |
-| a5a80f497a95_rule.yml | Success: 2 pages, 3,644 chars | Failed: line 59 |
+| PDF | 1 page, 74 characters | PyMuPDF: 1 page, 75 characters; pypdf: 1 page, 74 characters |
+| HTML | 1 page, 74 characters | Trafilatura: 74 characters; plain tag stripping: 91 characters |
 
-**Measured results:**
+These fixture checks confirm that the comparison paths execute. They are not measurements of the downloaded corpus.
 
-- Total downloaded files compared: 10.
-- HardenHelp parser: 10/10 successful.
-- PyYAML: 6/10 successful.
-- PyYAML failed on 4 files.
-- The `.var` file was successfully loaded by both approaches.
-- HardenHelp produced page-based output while PyYAML produced structured Python objects for compatible files.
+**Limitations**
 
-**Conclusion:**
+- The corpus run records successful parsing/output, not parsing speed, memory use or semantic accuracy.
+- The PDF and HTML comparisons use small temporary fixtures, not representative production documents.
+- No performance conclusion should be drawn from these checks.
 
-HardenHelp successfully processed all 10 files in this comparison. PyYAML successfully loaded 6 files but failed on 4. This demonstrates that the existing parser handles this collected source corpus more consistently while also producing page-based output suitable for ingestion.
+### Tests
 
-**Limitation:** This comparison measures parsing success and output structure. It does not establish parsing speed, memory usage or semantic accuracy.
+Latest recorded Day 7 parser and storage test run:
+
+```text
+uv run pytest tests/unit/test_parse.py tests/integration/test_parse_store.py -v
+
+24 passed, 1 warning
+```
+
+The warning was an optional PySocks dependency warning; the tests passed.
 
 ### Observations
 
@@ -377,7 +408,7 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 - Individual YAML rule files retain their original structured content.
 - No parsing failures were recorded for this corpus.
 
-### D08 · LLM gateway
+## D08 · LLM gateway
 
 - Primary: gemini-3.8-flash (Gemini) · fallback: openai/gpt-oss-20b (Groq)
 - First question on my laptop: first words after ___ s, total ___ s, tokens in ___ / out ___, cost Rs ___
@@ -481,7 +512,7 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 
 - My best router prompt: classify_v__ with ___ / 20
 - What I changed in v4, and what happened to the score:
-- The question my best version still gets wrong (line, wanted, got), and why I think so:
+- The question my best version still gets wrong (line, wanted, got), and why I think so
 - A label in my test set that I changed after seeing the results (or "none"):
 - Input tokens per question: v1 ___ , best version ___ . Is the extra accuracy worth it?
 
@@ -500,3 +531,47 @@ HardenHelp successfully processed all 10 files in this comparison. PyYAML succes
 - Cost at list price: Rs ___ in total, Rs ___ per document
 
 ### One thing that went wrong today, and how I fixed it
+### D09 · Prompts and structured output
+
+#### Prompt comparison
+
+- My best router prompt: classify_v1, classify_v2, classify_v3 and classify_v4 tied at 20 / 20 (100%) in the cached evaluation.
+- What I changed in v4, and what happened to the score: v4 was added and evaluated against the same 20-question test set. All four versions scored 20 / 20, so v4 did not demonstrate an accuracy improvement.
+- The question my best version still gets wrong: None in the cached evaluation; all 20 questions were classified correctly.
+- A label in my test set that I changed after seeing the results: none.
+- Input tokens per question: v1 not recorded; best version not recorded. The token comparison was not captured.
+- Evaluation details: 80 cached responses across four versions. The final comparison run made 0 new model calls. These results are cached evaluation results, not a fresh live-model comparison.
+
+| Prompt | Correct | Missed | Invalid | Accuracy |
+|---|---:|---:|---:|---:|
+| classify_v1 | 20 | 0 | 0 | 100% |
+| classify_v2 | 20 | 0 | 0 | 100% |
+| classify_v3 | 20 | 0 | 0 | 100% |
+| classify_v4 | 20 | 0 | 0 | 100% |
+
+#### My contract (DocMeta)
+
+- Fields kept from my project card: stig_id, rule_id, cci, ssg_rule, severity, os, check and fix.
+- Fields deleted: none of the project-card fields were deleted.
+- Common fields: doc_kind, year, language, summary and topics.
+- The field I tightened: doc_kind uses a Literal with an allowed set of document kinds. Year is also bounded between 1950 and 2027. Topics are converted to lowercase and duplicates are removed.
+- Each project-specific field is a list because one document can cover multiple rules or identifiers.
+
+#### Extraction run
+
+- Prompt version: extract_metadata_v1.md.
+- Documents successfully extracted today: 14 total (1 trial document and 13 in the subsequent run).
+- Repaired: 0 reported.
+- Invalid metadata records: 0 reported.
+- The subsequent run stopped after a Gemini ReadTimeout on document 144.
+- Not finished: 393 documents remain pending. The extraction script stopped when Gemini became unavailable; successful records were saved, so the run can resume.
+- Most common failure reason: Gemini ReadTimeout. The script stopped rather than continuing to send requests while the provider was unavailable.
+- A record that was valid but wrong: not yet established through manual comparison against five source documents.
+- Token usage: the 13-document run used 16,742 input tokens and 2,204 output tokens. The separate one-document trial used 1,202 input and 131 output tokens.
+- Reported extraction cost: Rs 0.000000 in the script output. This is the reported value, not an independently calculated list-price estimate.
+
+#### One thing that went wrong today, and how I fixed it
+
+The full metadata extraction stopped because Gemini returned a ReadTimeout. The script preserved the successful records and stopped safely. I can resume the pending documents by running the extraction command again when the provider is available.
+
+The corpus extraction is still incomplete: 393 documents remain pending. The 50-document minimum and the five-document manual verification requirement have not yet been met.

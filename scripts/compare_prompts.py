@@ -115,7 +115,8 @@ async def run_evaluation(
 ) -> list[dict]:
     """Evaluate prompts, using cached answers whenever possible."""
     settings = get_settings()
-    gateway = build_gateway(settings)
+    gemini_only_settings = settings.model_copy(update={"groq_api_key": ""})
+    gateway = build_gateway(gemini_only_settings)
 
     cache = load_cache(cache_file)
     results = []
@@ -224,7 +225,10 @@ async def run_evaluation(
 
                     results.append(record)
 
-                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    evaluation_record = {
+                        key: value for key, value in record.items() if key != "cache_key"
+                    }
+                    output.write(json.dumps(evaluation_record, ensure_ascii=False) + "\n")
                     output.flush()
 
     finally:
