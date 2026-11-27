@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Primary LLM: Gemini
     llm_primary_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
     gemini_api_key: str = ""
-    llm_primary_model: str = "gemini-3.5-flash"
+    llm_primary_model: str = "gemini-3.8-flash"
 
     # Fallback LLM: Groq
     llm_fallback_base_url: str = "https://api.groq.com/openai/v1"
@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     llm_fallback_model: str = "openai/gpt-oss-20b"
 
     # Shared LLM settings
-    llm_timeout_seconds: float = 30.0
+    llm_timeout_seconds: float = 90.0
     usd_inr: float = 85.0
 
     @field_validator("database_url")
