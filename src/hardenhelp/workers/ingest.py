@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from hardenhelp.db.models import Document, IngestItem
 from hardenhelp.ingest.fetch import RETRYABLE, HostGate, Robots, Source, fetch_one
 from hardenhelp.ingest.parse import ParseError, parse_file
-from hardenhelp.ingest.store import document_id, save_document, save_failure
+from hardenhelp.ingest.store import document_id, save_failure, save_parsed
 from hardenhelp.llm.extract import document_text, extract, save
 
 logger = logging.getLogger("hardenhelp.worker")
@@ -124,7 +124,7 @@ async def process(ctx: dict, session: AsyncSession, item: IngestItem) -> tuple[s
                 await session.commit()
                 raise Permanent(f"parse: {error.reason}") from error
 
-            await save_document(session, record, parsed)
+            await save_parsed(session, path=path, record=record, parsed=parsed)
             await session.commit()
             document = await session.scalar(select(Document).where(Document.external_id == doc_id))
             status = "done"
