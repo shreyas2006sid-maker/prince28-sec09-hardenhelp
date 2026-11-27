@@ -50,6 +50,7 @@ async def save_parsed(
         "source": record.get("source", ""),
         "path": file_path,
         "parser": parsed.parser,
+        "kind": parsed.kind,
         "pages": len(parsed.pages),
         "tables": sum(page.tables for page in parsed.pages),
         "chars": sum(len(page.text) for page in parsed.pages),

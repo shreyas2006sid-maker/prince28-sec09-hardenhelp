@@ -20,3 +20,5 @@ data/raw/
 .coverage
 htmlcov/
 eval/cache/
+
+temp/
