@@ -13,7 +13,7 @@ from hardenhelp.db.llm_calls import make_recorder
 from hardenhelp.db.models import Document, Page
 from hardenhelp.db.session import make_engine, make_sessionmaker
 from hardenhelp.llm.extract import extract_metadata
-from hardenhelp.llm.gateway import LLMUnavailable
+from hardenhelp.llm.gateway import LLMUnavailable, build_gateway
 from hardenhelp.logging_setup import request_id_ctx
 
 MAX_DOCUMENT_CHARS = 18000
@@ -195,22 +195,27 @@ async def main() -> None:
     settings = get_settings()
     prompt = load_prompt(settings.prompts_dir / "extract_metadata_v1.md")
 
-    # This extraction run must use Gemini only, never Groq fallback.
-    gemini_only_settings = settings.model_copy(update={"groq_api_key": ""})
-
     engine = make_engine(settings)
     session_factory = make_sessionmaker(engine)
 
-    from hardenhelp.llm.gateway import build_gateway
-
     gateway = build_gateway(
-        gemini_only_settings,
+        settings,
         make_recorder(session_factory),
     )
 
     if not gateway.providers:
         await engine.dispose()
-        raise RuntimeError("Gemini is not configured. Check GEMINI_API_KEY.")
+        raise RuntimeError(
+            "No LLM providers are configured. Check GEMINI_API_KEY and GROQ_API_KEY."
+        )
+
+    provider_order = []
+
+    if settings.gemini_api_key:
+        provider_order.append(f"gemini/{settings.llm_primary_model}")
+
+    if settings.groq_api_key:
+        provider_order.append(f"groq/{settings.llm_fallback_model}")
 
     stats = {
         "extracted": 0,
@@ -243,7 +248,7 @@ async def main() -> None:
 
             documents = list((await session.scalars(statement)).all())
 
-        print("Provider: Gemini only", flush=True)
+        print(f"Provider order: {' -> '.join(provider_order)}", flush=True)
         print(f"Documents selected: {len(documents)}", flush=True)
 
         for document_id in documents:
@@ -267,7 +272,10 @@ async def main() -> None:
             elif outcome == "unavailable":
                 stats["failed"] += 1
                 stopped = True
-                print("Stopping because Gemini is unavailable.", flush=True)
+                print(
+                    "Stopping because all configured LLM providers are unavailable.",
+                    flush=True,
+                )
                 break
             else:
                 stats["failed"] += 1
@@ -318,7 +326,7 @@ async def main() -> None:
     print(f"Seconds:        {elapsed:.1f}")
 
     if stopped:
-        print("Status: Stopped due to Gemini unavailability")
+        print("Status: Stopped because all configured LLM providers are unavailable")
     elif stats["invalid"] or stats["failed"]:
         print("Status: Completed with errors")
     else:
